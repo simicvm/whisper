@@ -1,3 +1,5 @@
+import AppKit
+import Carbon.HIToolbox.Events
 import SwiftUI
 
 /// The dropdown content shown when clicking the menu bar icon.
@@ -5,7 +7,8 @@ struct MenuBarView: View {
     @Bindable var appState: AppState
     var onModelSelect: (STTModelDefinition) -> Void
     var onDeleteLocalModel: (STTModelDefinition) -> Void
-    var onHotkeyPresetSelect: (ModifierHotkeyPreset) -> Void
+    var onHotkeyBindingSave: (HotkeyBinding) -> Void
+    var onHotkeyEditorPresentedChange: (Bool) -> Void
     var runOnStartupEnabled: Bool
     var onRunOnStartupToggle: () -> Void
     var onRequestMicrophonePermission: () -> Void
@@ -18,6 +21,11 @@ struct MenuBarView: View {
     @State private var hoveredDownloadModelID: String?
     @State private var isHoveringRunOnStartup = false
     @State private var isHoveringQuit = false
+    @State private var isCapturingHotkey = false
+    @State private var capturePressedKeyCodes: Set<UInt16> = []
+    @State private var latestCapturedKeyCodes: Set<UInt16> = []
+    @State private var hotkeyCaptureLocalMonitor: Any?
+    @State private var hotkeyCaptureGlobalMonitor: Any?
     private let infoLabelWidth: CGFloat = 94
 
     var body: some View {
@@ -41,6 +49,9 @@ struct MenuBarView: View {
         }
         .padding(10)
         .frame(width: 300)
+        .onDisappear {
+            stopHotkeyCapture(notifyState: true)
+        }
     }
 
     @ViewBuilder
@@ -166,15 +177,19 @@ struct MenuBarView: View {
     private var infoSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             infoRow(label: "Push to Talk") {
-                Picker("Push to Talk", selection: hotkeySelectionBinding) {
-                    ForEach(ModifierHotkeyPreset.allCases) { preset in
-                        Text(preset.displayLabel).tag(preset)
-                    }
+                Button {
+                    toggleHotkeyCapture()
+                } label: {
+                    Text(captureButtonLabel)
+                        .font(.system(.caption, weight: .semibold))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .foregroundStyle(isCapturingHotkey ? .red : .primary)
                 }
-                .labelsHidden()
-                .pickerStyle(.menu)
-                .frame(width: 165, alignment: .trailing)
+                .buttonStyle(.bordered)
+                .controlSize(.small)
                 .disabled(appState.phase != .idle)
+                .help("Click and press key combination")
             }
 
             if let hotkeySettingsMessage = appState.hotkeySettingsMessage {
@@ -326,15 +341,6 @@ struct MenuBarView: View {
         }
     }
 
-    private var hotkeySelectionBinding: Binding<ModifierHotkeyPreset> {
-        Binding(
-            get: { appState.hotkeyPreset },
-            set: { preset in
-                onHotkeyPresetSelect(preset)
-            }
-        )
-    }
-
     private var isModelInteractionDisabled: Bool {
         switch appState.phase {
         case .recording, .transcribing, .pasting:
@@ -344,4 +350,121 @@ struct MenuBarView: View {
         }
     }
 
+    /// Label shown on the hotkey capture button, with live feedback of currently pressed keys.
+    private var captureButtonLabel: String {
+        guard isCapturingHotkey else {
+            return appState.hotkeyBinding.displayLabel
+        }
+        if latestCapturedKeyCodes.isEmpty {
+            return "Press keys... (Esc to cancel)"
+        }
+        return HotkeyBinding(keyCodes: latestCapturedKeyCodes).displayLabel + "..."
+    }
+
+    private func toggleHotkeyCapture() {
+        if isCapturingHotkey {
+            stopHotkeyCapture(notifyState: true)
+        } else {
+            startHotkeyCapture()
+        }
+    }
+
+    private func startHotkeyCapture() {
+        guard !isCapturingHotkey else { return }
+        isCapturingHotkey = true
+        capturePressedKeyCodes.removeAll()
+        latestCapturedKeyCodes.removeAll()
+        installHotkeyCaptureMonitorIfNeeded()
+        onHotkeyEditorPresentedChange(true)
+    }
+
+    private func stopHotkeyCapture(notifyState: Bool) {
+        guard isCapturingHotkey || hotkeyCaptureLocalMonitor != nil || hotkeyCaptureGlobalMonitor != nil else { return }
+        isCapturingHotkey = false
+        capturePressedKeyCodes.removeAll()
+        latestCapturedKeyCodes.removeAll()
+        removeHotkeyCaptureMonitor()
+
+        if notifyState {
+            onHotkeyEditorPresentedChange(false)
+        }
+    }
+
+    private func installHotkeyCaptureMonitorIfNeeded() {
+        guard hotkeyCaptureLocalMonitor == nil else { return }
+
+        // Local monitor: captures events delivered to this app's windows (can swallow them).
+        hotkeyCaptureLocalMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.flagsChanged, .keyDown, .keyUp]
+        ) { event in
+            handleHotkeyCaptureEvent(event)
+            return nil
+        }
+
+        // Global monitor: captures events when the popover loses focus but is still visible.
+        hotkeyCaptureGlobalMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.flagsChanged, .keyDown, .keyUp]
+        ) { event in
+            handleHotkeyCaptureEvent(event)
+        }
+    }
+
+    private func removeHotkeyCaptureMonitor() {
+        if let local = hotkeyCaptureLocalMonitor {
+            NSEvent.removeMonitor(local)
+            hotkeyCaptureLocalMonitor = nil
+        }
+        if let global = hotkeyCaptureGlobalMonitor {
+            NSEvent.removeMonitor(global)
+            hotkeyCaptureGlobalMonitor = nil
+        }
+    }
+
+    private func handleHotkeyCaptureEvent(_ event: NSEvent) {
+        guard isCapturingHotkey else { return }
+
+        switch event.type {
+        case .keyDown:
+            guard !event.isARepeat else { return }
+            if event.keyCode == UInt16(kVK_Escape) {
+                stopHotkeyCapture(notifyState: true)
+                return
+            }
+            capturePressedKeyCodes.insert(event.keyCode)
+            latestCapturedKeyCodes = capturePressedKeyCodes
+
+        case .keyUp:
+            capturePressedKeyCodes.remove(event.keyCode)
+            maybeCommitCapturedHotkeyIfComplete()
+
+        case .flagsChanged:
+            let keyCode = event.keyCode
+            guard HotkeyKeyCode.modifierCodes.contains(keyCode) else { return }
+
+            let isPressed = HotkeyBinding.isModifierPressed(
+                keyCode: keyCode,
+                flagsRaw: UInt64(event.modifierFlags.rawValue)
+            )
+
+            if isPressed {
+                capturePressedKeyCodes.insert(keyCode)
+                latestCapturedKeyCodes = capturePressedKeyCodes
+            } else {
+                capturePressedKeyCodes.remove(keyCode)
+                maybeCommitCapturedHotkeyIfComplete()
+            }
+
+        default:
+            return
+        }
+    }
+
+    private func maybeCommitCapturedHotkeyIfComplete() {
+        guard capturePressedKeyCodes.isEmpty else { return }
+        guard latestCapturedKeyCodes.count >= 2 else { return }
+
+        let binding = HotkeyBinding(keyCodes: latestCapturedKeyCodes)
+        onHotkeyBindingSave(binding)
+        stopHotkeyCapture(notifyState: true)
+    }
 }

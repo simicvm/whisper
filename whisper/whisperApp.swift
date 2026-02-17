@@ -16,7 +16,7 @@ struct WhisperApp: App {
     @State private var overlayManager = OverlayManager()
     @State private var audioRecorder = AudioRecorder()
     private let transcriptionService = sharedTranscriptionService
-    @State private var hotkeyMonitor = ModifierHotkeyMonitor()
+    @State private var hotkeyMonitor = HotkeyMonitor()
     @State private var modelLoadTask: Task<Void, Never>?
     // UI stale-completion guard. Kept separate from TranscriptionService.loadGeneration,
     // which guards actor-owned model state.
@@ -40,8 +40,11 @@ struct WhisperApp: App {
                         await deleteLocalModel(model)
                     }
                 },
-                onHotkeyPresetSelect: { preset in
-                    updateHotkeyPreset(preset)
+                onHotkeyBindingSave: { binding in
+                    updateHotkeyBinding(binding)
+                },
+                onHotkeyEditorPresentedChange: { isPresented in
+                    appState.isEditingHotkey = isPresented
                 },
                 runOnStartupEnabled: appState.runOnStartupEnabled,
                 onRunOnStartupToggle: {
@@ -149,7 +152,7 @@ struct WhisperApp: App {
 
     @MainActor
     private func setupHotkey() {
-        hotkeyMonitor.preset = appState.hotkeyPreset
+        hotkeyMonitor.binding = appState.hotkeyBinding
 
         hotkeyMonitor.onKeyDown = {
             Task { @MainActor in
@@ -166,23 +169,24 @@ struct WhisperApp: App {
 
     @MainActor
     private func configureHotkeyFromDefaults() {
-        let (preset, fallbackMessage) = ModifierHotkeyPreset.load()
-        appState.hotkeyPreset = preset
+        let (binding, fallbackMessage) = HotkeyBinding.load()
+        appState.hotkeyBinding = binding
         appState.hotkeySettingsMessage = fallbackMessage
     }
 
     @MainActor
-    private func updateHotkeyPreset(_ preset: ModifierHotkeyPreset) {
-        appState.hotkeyPreset = preset
+    private func updateHotkeyBinding(_ binding: HotkeyBinding) {
+        appState.hotkeyBinding = binding
         appState.hotkeySettingsMessage = nil
-        hotkeyMonitor.preset = preset
-        preset.save()
+        hotkeyMonitor.binding = binding
+        binding.save()
     }
 
     @MainActor
     private func handleKeyDown() async {
         refreshPermissionState()
 
+        guard !appState.isEditingHotkey else { return }
         guard appState.phase == .idle else { return }
         guard appState.modelStatus == .loaded else { return }
 

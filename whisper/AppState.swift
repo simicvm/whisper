@@ -45,8 +45,9 @@ private extension AppPhase {
 final class AppState {
     var phase: AppPhase = .idle
     var selectedModelID: String = STTModelDefinition.default.repoID
-    var hotkeyPreset: ModifierHotkeyPreset = .defaultPreset
+    var hotkeyBinding: HotkeyBinding = .defaultBinding
     var hotkeySettingsMessage: String?
+    var isEditingHotkey = false
     var modelStatus: ModelStatus = .notLoaded
     var downloadedModelRepoIDs: Set<String> = []
     var microphonePermission: PermissionStatus = .unknown

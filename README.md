@@ -6,11 +6,11 @@ All processing runs locally using [Qwen3 ASR](https://huggingface.co/collections
 
 ## Features
 
-- **Push-to-talk hotkey** — configurable two-modifier combinations (e.g. Left Cmd + Left Ctrl) detected via a global CGEvent tap
+- **Push-to-talk hotkey** — configurable custom key combinations (including left/right modifiers) with global detection via a CGEvent tap
 - **Multiple model options** — Qwen3 ASR 0.6B (8-bit), 1.7B (8-bit), and 1.7B (4-bit) with on-demand downloading and per-model cache management
 - **Smart paste** — transcribed text is written to the pasteboard, Cmd+V is simulated via Accessibility, and the original clipboard contents are restored afterward; a space is prepended when the cursor follows non-whitespace
 - **Visual feedback** — animated floating overlay with a MeshGradient whose speed responds to real-time audio level
-- **Menu bar UI** — model selector with download/delete controls, permission status indicators, hotkey preset picker, and run-on-startup toggle
+- **Menu bar UI** — model selector with download/delete controls, permission status indicators, inline hotkey capture, and run-on-startup toggle
 - **Privacy-first** — fully offline inference, no network calls after model download
 
 ## Requirements
@@ -50,7 +50,7 @@ All processing runs locally using [Qwen3 ASR](https://huggingface.co/collections
 
 ## How It Works
 
-1. A global CGEvent tap listens for a specific modifier-key combination (left/right aware).
+1. A global CGEvent tap listens for the configured key combination (left/right modifier aware).
 2. On key-down, `AVAudioEngine` begins capturing microphone input at the native sample rate.
 3. On key-up, recording stops. Audio is resampled to 16 kHz and passed to the Qwen3 ASR model running on-device via MLX.
 4. The transcribed text is placed on the pasteboard, a Cmd+V keystroke is simulated through the Accessibility API, and the original pasteboard contents are restored.
@@ -76,7 +76,7 @@ Models/
   STTModelDefinition      Model registry (name, HuggingFace repo, quantization)
 
 Hotkey/
-  HotkeyDefinitions       CGEvent tap, modifier presets, UserDefaults persistence
+  HotkeyDefinitions       CGEvent tap, custom key combos, UserDefaults persistence + legacy migration
 ```
 
 ## Dependencies
