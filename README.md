@@ -83,7 +83,7 @@ Hotkey/
 
 | Package | Requirement | Products used | Purpose |
 |---------|-------------|---------------|---------|
-| [mlx-audio-swift](https://github.com/Blaizzy/mlx-audio-swift) | `revision: cc3b3880be05caf908970729e15ec209d018f06d` | `MLXAudioSTT`, `MLXAudioCore` | On-device speech-to-text and audio ML pipeline |
+| [mlx-audio-swift](https://github.com/Blaizzy/mlx-audio-swift) | `revision: 2fd41458059e2d80403436167d5263f585d120d4` | `MLXAudioSTT`, `MLXAudioCore` | On-device speech-to-text and audio ML pipeline |
 
 ## License
 
