@@ -1,24 +1,18 @@
 import AppKit
 import SwiftUI
 
-private final class TransparentHostingView<Content: View>: NSHostingView<Content> {
-    override var isOpaque: Bool {
-        false
-    }
-}
-
 /// A floating, non-activating panel adapted from a blog-style NSPanel implementation.
-final class FloatingPanel<Content: View>: NSPanel {
+final class FloatingPanel: NSPanel {
     @Binding private var isPresented: Bool
-    private let hostingView: TransparentHostingView<Content>
+    private let hostingView: NSHostingView<AnyView>
 
     init(
-        @ViewBuilder view: () -> Content,
+        @ViewBuilder view: () -> some View,
         contentRect: NSRect,
         isPresented: Binding<Bool>
     ) {
         self._isPresented = isPresented
-        self.hostingView = TransparentHostingView(rootView: view())
+        self.hostingView = NSHostingView(rootView: AnyView(view()))
 
         super.init(
             contentRect: contentRect,
@@ -34,6 +28,7 @@ final class FloatingPanel<Content: View>: NSPanel {
         hidesOnDeactivate = false
 
         isOpaque = false
+        hostingView.layer?.isOpaque = false
         backgroundColor = .clear
         collectionBehavior = [.canJoinAllSpaces, .stationary]
         ignoresMouseEvents = true
@@ -42,8 +37,8 @@ final class FloatingPanel<Content: View>: NSPanel {
         contentView = hostingView
     }
 
-    func updateView(@ViewBuilder _ view: () -> Content) {
-        hostingView.rootView = view()
+    func updateView(@ViewBuilder _ view: () -> some View) {
+        hostingView.rootView = AnyView(view())
     }
 
     override func resignMain() {

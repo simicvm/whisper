@@ -4,7 +4,7 @@ import SwiftUI
 /// Manages the lifecycle of the floating recording indicator panel.
 @MainActor
 final class OverlayManager {
-    private var panel: FloatingPanel<RecordingOverlayView>?
+    private var panel: FloatingPanel?
     private var isPresented = false
     private let overlaySize = CGSize(width: RecordingOverlayView.circleDiameter, height: RecordingOverlayView.circleDiameter)
 
