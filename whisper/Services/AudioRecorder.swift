@@ -42,6 +42,13 @@ final class AudioRecorder: @unchecked Sendable {
         isRecording = true
         lock.unlock()
 
+        // Capture callback and sample rate as locals so the tap closure
+        // doesn't read instance properties from the audio thread without
+        // synchronisation. Both values are immutable for the lifetime of
+        // this recording session.
+        let capturedOnLevel = onLevel
+        let capturedRate = nativeSampleRate
+
         // Tap in the native format — no conversion during recording
         inputNode.installTap(onBus: 0, bufferSize: 4096, format: nativeFormat) { [weak self] buffer, _ in
             guard let self else { return }
@@ -53,7 +60,7 @@ final class AudioRecorder: @unchecked Sendable {
             let bufferPointer = UnsafeBufferPointer(start: channelData[0], count: count)
 
             // Compute RMS level
-            if let onLevel = self.onLevel {
+            if let onLevel = capturedOnLevel {
                 var sumOfSquares: Float = 0
                 for sample in bufferPointer {
                     sumOfSquares += sample * sample
@@ -66,7 +73,7 @@ final class AudioRecorder: @unchecked Sendable {
 
             self.lock.lock()
             if self.isRecording {
-                let maxNativeSamples = Int(self.nativeSampleRate * self.maximumDuration)
+                let maxNativeSamples = Int(capturedRate * self.maximumDuration)
                 let remaining = maxNativeSamples - self.nativeSamples.count
 
                 if remaining > 0 {

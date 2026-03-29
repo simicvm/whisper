@@ -6,6 +6,19 @@ import Carbon.HIToolbox
 @MainActor
 struct PasteController {
 
+    /// Time to wait after writing to the pasteboard before simulating Cmd+V.
+    /// Gives the system pasteboard server time to propagate the change.
+    private static let pasteboardSettleDelay: Duration = .milliseconds(50)
+
+    /// Time to wait after simulating Cmd+V before restoring the original clipboard.
+    /// Must be long enough for the target application to read the pasteboard.
+    /// Slow consumers (rich text editors, remote desktop clients) may need more.
+    private static let pasteCompletionDelay: Duration = .milliseconds(400)
+
+    /// Brief gap between the Cmd+V key-down and key-up events so the target
+    /// application reliably registers the keystroke.
+    private static let keyEventGap: Duration = .milliseconds(10)
+
     /// Paste text into the active application.
     /// Saves and restores the original clipboard contents.
     static func paste(_ text: String) async throws {
@@ -28,7 +41,7 @@ struct PasteController {
         let stagedChangeCount = pasteboard.changeCount
 
         // Small delay to ensure pasteboard is updated
-        try? await Task.sleep(for: .milliseconds(50))
+        try? await Task.sleep(for: pasteboardSettleDelay)
 
         // Simulate Cmd+V keystroke
         do {
@@ -43,7 +56,7 @@ struct PasteController {
         }
 
         // Restore original pasteboard after paste completes
-        try? await Task.sleep(for: .milliseconds(300))
+        try? await Task.sleep(for: pasteCompletionDelay)
         restorePasteboard(
             snapshot,
             to: pasteboard,
@@ -127,13 +140,21 @@ struct PasteController {
             return false
         }
 
-        // Get the character just before the cursor
-        let utf16 = text.utf16
-        let idx = utf16.index(utf16.startIndex, offsetBy: cursorPosition - 1)
-        guard let scalar = Unicode.Scalar(utf16[idx]) else { return false }
-        let char = Character(scalar)
+        // Convert the UTF-16 offset from the AX API into a proper String.Index.
+        // This correctly handles multi-code-unit characters (emoji, CJK, etc.)
+        // that are represented as surrogate pairs in UTF-16.
+        let utf16View = text.utf16
+        let cursorUTF16Index = utf16View.index(utf16View.startIndex, offsetBy: cursorPosition)
 
-        return !char.isWhitespace
+        guard let stringIndex = cursorUTF16Index.samePosition(in: text),
+              stringIndex > text.startIndex else {
+            // Cursor is between the two halves of a surrogate pair, meaning
+            // the character is non-BMP (emoji, etc.) which is never whitespace.
+            return true
+        }
+
+        let charBeforeCursor = text[text.index(before: stringIndex)]
+        return !charBeforeCursor.isWhitespace
     }
 
     private static func writeText(_ text: String, to pasteboard: NSPasteboard) -> Bool {
@@ -196,7 +217,7 @@ struct PasteController {
         keyDown.post(tap: .cghidEventTap)
 
         // Brief delay between down and up
-        try? await Task.sleep(for: .milliseconds(10))
+        try? await Task.sleep(for: keyEventGap)
 
         // Key up
         guard let keyUp = CGEvent(

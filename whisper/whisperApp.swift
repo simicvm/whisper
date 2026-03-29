@@ -251,11 +251,11 @@ struct WhisperApp: App {
             cancelRecordingTimeout()
         }
 
-        let samples = audioRecorder.stop()
+        let rawSamples = audioRecorder.stop()
         appState.audioLevel = 0
 
         let minimumSamples = Int(Self.minimumSpeechDurationSeconds * Self.transcriptionSampleRate)
-        guard samples.count >= minimumSamples else {
+        guard rawSamples.count >= minimumSamples else {
             overlayManager.hide()
             _ = appState.transition(to: .error("Recording too short. Hold the hotkey briefly and try again."))
             resetAfterDelay(seconds: 2)
@@ -266,7 +266,22 @@ struct WhisperApp: App {
         overlayManager.show(appState: appState)
 
         do {
-            let text = try await transcriptionService.transcribe(audio: samples)
+            // Trim leading/trailing silence and normalise gain before inference.
+            let trimmed = AudioProcessing.trimSilence(
+                from: rawSamples,
+                sampleRate: Self.transcriptionSampleRate
+            )
+            let processed = AudioProcessing.normalizeGain(trimmed)
+
+            // Re-check minimum duration after silence removal.
+            guard processed.count >= minimumSamples else {
+                overlayManager.hide()
+                _ = appState.transition(to: .error("No speech detected. Hold the hotkey, speak, then release."))
+                resetAfterDelay(seconds: 2)
+                return
+            }
+
+            let text = try await transcriptionService.transcribe(audio: processed)
 
             _ = appState.transition(to: .pasting)
             try await PasteController.paste(text)
