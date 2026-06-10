@@ -364,6 +364,11 @@ final class HotkeyMonitor {
     fileprivate var pressedKeyCodes: Set<UInt16> = []
     private(set) var isHeld = false
 
+    /// Whether the event tap was created successfully and is installed.
+    /// Tap creation fails (silently, in `start()`) until the process is
+    /// trusted for Accessibility, so callers should retry once trust arrives.
+    var isRunning: Bool { eventTap != nil }
+
     func start() {
         guard eventTap == nil else { return }
 

@@ -23,6 +23,8 @@ struct WhisperApp: App {
     @State private var modelLoadGeneration: UInt64 = 0
     @State private var hasLaunched = false
     @State private var recordingTimeoutTask: Task<Void, Never>?
+    @State private var hotkeyConfigured = false
+    @State private var accessibilityPollTask: Task<Void, Never>?
 
     private static let maxRecordingDurationSeconds = AudioRecorder.defaultMaximumDuration
     private static let minimumSpeechDurationSeconds = 0.2
@@ -101,14 +103,21 @@ struct WhisperApp: App {
         // Request permissions
         await requestPermissions()
 
+        // Start listening for hotkey events. This runs before model loading so
+        // the tap exists as early as possible; key presses during load are
+        // ignored by the modelStatus guard in handleKeyDown.
+        setupHotkey()
+
+        // If Accessibility isn't granted yet, the tap above failed to install.
+        // Watch for the user granting it in System Settings so the hotkey
+        // starts working without an app relaunch.
+        startAccessibilityPollIfNeeded()
+
         // Discover locally cached models
         await refreshDownloadedModels()
 
         // Load model
         await loadModel(repoID: defaultRepoID)
-
-        // Start listening for hotkey events
-        setupHotkey()
     }
 
     // MARK: - Startup Login Item
@@ -165,6 +174,30 @@ struct WhisperApp: App {
             }
         }
         hotkeyMonitor.start()
+        hotkeyConfigured = true
+    }
+
+    /// Polls Accessibility trust for a few minutes after launch so the event
+    /// tap can be installed as soon as the user grants permission.
+    @MainActor
+    private func startAccessibilityPollIfNeeded() {
+        guard !appState.hasAccessibilityPermission else { return }
+        guard accessibilityPollTask == nil else { return }
+
+        accessibilityPollTask = Task { @MainActor in
+            defer { accessibilityPollTask = nil }
+            for _ in 0..<180 {
+                do {
+                    try await Task.sleep(for: .seconds(1))
+                } catch {
+                    return
+                }
+                refreshPermissionState()
+                if appState.hasAccessibilityPermission {
+                    return
+                }
+            }
+        }
     }
 
     @MainActor
@@ -455,8 +488,18 @@ struct WhisperApp: App {
     @MainActor
     private func refreshPermissionState() {
         appState.microphonePermission = microphonePermissionStatus()
-        appState.accessibilityPermission =
-            PasteController.hasAccessibilityPermission ? .granted : .denied
+
+        let wasGranted = appState.accessibilityPermission == .granted
+        let isGranted = PasteController.hasAccessibilityPermission
+        appState.accessibilityPermission = isGranted ? .granted : .denied
+
+        // The keyboard event tap can't be created until the process is trusted
+        // for Accessibility. If trust arrived after launch (or the tap died),
+        // restart the monitor so the hotkey works without a relaunch.
+        if hotkeyConfigured, isGranted, !wasGranted || !hotkeyMonitor.isRunning {
+            hotkeyMonitor.stop()
+            hotkeyMonitor.start()
+        }
     }
 
     private func microphonePermissionStatus() -> PermissionStatus {
