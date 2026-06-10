@@ -439,7 +439,10 @@ struct MenuBarView: View {
 
         case .flagsChanged:
             let keyCode = event.keyCode
-            guard HotkeyKeyCode.modifierCodes.contains(keyCode) else { return }
+            // Caps Lock can't participate in a push-to-talk chord (its flag is
+            // a latched lock state, not key-held state) — don't capture it.
+            guard keyCode != HotkeyKeyCode.capsLock,
+                  HotkeyKeyCode.modifierCodes.contains(keyCode) else { return }
 
             let isPressed = HotkeyBinding.isModifierPressed(
                 keyCode: keyCode,

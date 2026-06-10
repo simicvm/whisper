@@ -70,6 +70,13 @@ struct HotkeyBinding: Codable, Hashable, Sendable {
         keyCodes.contains { !HotkeyKeyCode.modifierCodes.contains($0) }
     }
 
+    /// A copy of this binding with Caps Lock removed. Caps Lock's event flag
+    /// is a latched lock state rather than key-held state, so it cannot work
+    /// as part of a push-to-talk chord.
+    func removingCapsLock() -> Self {
+        .init(keyCodes: keyCodes.filter { $0 != HotkeyKeyCode.capsLock })
+    }
+
     var displayLabel: String {
         guard !keyCodes.isEmpty else {
             return "Not Set"
@@ -96,6 +103,19 @@ struct HotkeyBinding: Codable, Hashable, Sendable {
                 if decoded.isEmpty {
                     return (defaultBinding, "Saved hotkey was empty. Using \(defaultBinding.displayLabel).")
                 }
+
+                // Strip Caps Lock from bindings saved by older versions.
+                let sanitized = decoded.removingCapsLock()
+                if sanitized.keyCodes != decoded.keyCodes {
+                    if sanitized.isEmpty {
+                        let fallback = defaultBinding
+                        fallback.save(defaults: defaults)
+                        return (fallback, "Caps Lock can't be used for push-to-talk. Using \(fallback.displayLabel).")
+                    }
+                    sanitized.save(defaults: defaults)
+                    return (sanitized, "Caps Lock can't be used for push-to-talk. Using \(sanitized.displayLabel).")
+                }
+
                 return (decoded, nil)
             } catch {
                 let fallback = defaultBinding
@@ -431,7 +451,12 @@ final class HotkeyMonitor {
         case .keyUp:
             pressedKeyCodes.remove(keyCode)
         case .flagsChanged:
-            guard HotkeyKeyCode.modifierCodes.contains(keyCode) else {
+            // Caps Lock's flag reflects the latched lock state, not whether
+            // the key is held. Tracking it would leave a phantom "pressed"
+            // key in the set whenever Caps Lock is on, breaking exact-match
+            // detection for every binding. Ignore it entirely.
+            guard keyCode != HotkeyKeyCode.capsLock,
+                  HotkeyKeyCode.modifierCodes.contains(keyCode) else {
                 return
             }
 
