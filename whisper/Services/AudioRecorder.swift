@@ -5,7 +5,11 @@ import Foundation
 final class AudioRecorder: @unchecked Sendable {
     static let defaultMaximumDuration: TimeInterval = 90
 
-    private var engine: AVAudioEngine?
+    /// Reused across recordings: rebuilding the engine (and the input audio
+    /// unit behind `inputNode`) on every key-down adds avoidable latency
+    /// before capture starts. `stop()` halts the engine — releasing the
+    /// microphone and its privacy indicator — but keeps the graph alive.
+    private var engine = AVAudioEngine()
     private var nativeSamples: [Float] = []
     private var nativeSampleRate: Double = 0
     private let lock = NSLock()
@@ -24,9 +28,6 @@ final class AudioRecorder: @unchecked Sendable {
     /// - Parameter onLevel: Called on every buffer with the current RMS level (0–1).
     func start(onLevel: (@Sendable (Float) -> Void)? = nil) throws {
         self.onLevel = onLevel
-
-        let engine = AVAudioEngine()
-        self.engine = engine
 
         let inputNode = engine.inputNode
         let nativeFormat = inputNode.outputFormat(forBus: 0)
@@ -90,7 +91,15 @@ final class AudioRecorder: @unchecked Sendable {
             self.lock.unlock()
         }
 
-        try engine.start()
+        do {
+            try engine.start()
+        } catch {
+            // A stale configuration (e.g. the default input device changed
+            // while idle) can fail to start. Discard the engine — and the tap
+            // installed above with it — so the next attempt starts clean.
+            engine = AVAudioEngine()
+            throw error
+        }
     }
 
     /// Stop recording and return the captured audio samples resampled to 16kHz mono float32.
@@ -102,9 +111,8 @@ final class AudioRecorder: @unchecked Sendable {
         nativeSamples.removeAll()
         lock.unlock()
 
-        engine?.inputNode.removeTap(onBus: 0)
-        engine?.stop()
-        engine = nil
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
         onLevel = nil
 
         guard !captured.isEmpty else { return [] }
