@@ -173,9 +173,22 @@ struct PasteController {
         return pasteboard.setString(text, forType: .string)
     }
 
+    /// Pasteboard types whose data is promised rather than materialised.
+    /// Reading them with data(forType:) forces the source application to
+    /// resolve the promise synchronously, which can block the main thread
+    /// for a long time — and a promise is meaningless to restore once its
+    /// source context is gone. Skip them when snapshotting.
+    private static let promisedDataTypes: Set<String> = {
+        var types = Set(NSFilePromiseReceiver.readableDraggedTypes)
+        // Legacy NSFilesPromisePboardType, still emitted by some apps.
+        types.insert("Apple files promise pasteboard type")
+        return types
+    }()
+
     private static func capturePasteboardSnapshot(from pasteboard: NSPasteboard) -> PasteboardSnapshot {
         let snapshots = (pasteboard.pasteboardItems ?? []).map { item in
             let payloads = item.types.compactMap { type -> PasteboardPayload? in
+                guard !promisedDataTypes.contains(type.rawValue) else { return nil }
                 guard let data = item.data(forType: type) else { return nil }
                 return PasteboardPayload(type: type, data: data)
             }
