@@ -20,17 +20,20 @@ enum AudioProcessing {
     /// 5. Returns the audio between the first and last active windows,
     ///    plus a small pre-roll and post-roll to preserve natural onset/offset.
     ///
-    /// If no speech is detected the original audio is returned unchanged so
-    /// the downstream model can make the final decision.
+    /// If no window exceeds the speech threshold, `nil` is returned so the
+    /// caller can reject the recording. Passing the audio through instead
+    /// would hand the model pure noise (subsequently gain-normalised), which
+    /// is exactly the input ASR models hallucinate text on.
     ///
     /// - Parameters:
     ///   - samples: Mono float32 audio samples.
     ///   - sampleRate: Sample rate of `samples` (e.g. 16 000).
-    /// - Returns: A (possibly shorter) slice of the input.
+    /// - Returns: A (possibly shorter) slice of the input, or `nil` when no
+    ///   speech was detected.
     static func trimSilence(
         from samples: [Float],
         sampleRate: Double
-    ) -> [Float] {
+    ) -> [Float]? {
         let config = VADConfig()
         let windowSamples = Int(config.windowDuration * sampleRate)
         let hopSamples = Int(config.hopDuration * sampleRate)
@@ -59,8 +62,8 @@ enum AudioProcessing {
         // 4. Find first and last windows above the threshold.
         guard let firstActive = energies.firstIndex(where: { $0 > threshold }),
               let lastActive = energies.lastIndex(where: { $0 > threshold }) else {
-            // No speech detected — return unchanged.
-            return samples
+            // No speech detected.
+            return nil
         }
 
         // 5. Convert window indices to sample indices with pre/post roll.

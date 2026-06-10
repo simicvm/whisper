@@ -300,21 +300,22 @@ struct WhisperApp: App {
         overlayManager.show(appState: appState)
 
         do {
-            // Trim leading/trailing silence and normalise gain before inference.
+            // Trim leading/trailing silence before inference. A nil result
+            // means the VAD found no speech at all — reject the recording
+            // rather than amplifying noise and inviting hallucinated text.
             let trimmed = AudioProcessing.trimSilence(
                 from: rawSamples,
                 sampleRate: Self.transcriptionSampleRate
             )
-            let processed = AudioProcessing.normalizeGain(trimmed)
 
-            // Re-check minimum duration after silence removal.
-            guard processed.count >= minimumSamples else {
+            guard let trimmed, trimmed.count >= minimumSamples else {
                 overlayManager.hide()
                 _ = appState.transition(to: .error("No speech detected. Hold the hotkey, speak, then release."))
                 resetAfterDelay(seconds: 2)
                 return
             }
 
+            let processed = AudioProcessing.normalizeGain(trimmed)
             let text = try await transcriptionService.transcribe(audio: processed)
 
             _ = appState.transition(to: .pasting)
