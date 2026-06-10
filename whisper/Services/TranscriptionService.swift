@@ -127,6 +127,7 @@ actor TranscriptionService {
         try FileManager.default.createDirectory(at: modelDir, withIntermediateDirectories: true)
 
         let client = HubClient.default
+        let progressThrottle = DownloadProgressThrottle()
         _ = try await client.downloadSnapshot(
             of: hfRepoID,
             kind: .model,
@@ -137,10 +138,11 @@ actor TranscriptionService {
                 let fraction = progress.fractionCompleted
                 let normalized =
                     fraction.isFinite ? min(max(fraction, 0), 1) : 0
-                if let updateHandler {
-                    Task { @MainActor in
-                        updateHandler(.downloading(progress: normalized))
-                    }
+                guard let updateHandler, progressThrottle.shouldReport(normalized) else {
+                    return
+                }
+                Task { @MainActor in
+                    updateHandler(.downloading(progress: normalized))
                 }
             }
         )
@@ -295,4 +297,25 @@ enum TranscriptionError: LocalizedError {
 enum ModelLoadUpdate: Sendable {
     case downloading(progress: Double)
     case initializing
+}
+
+/// Rate-limits download progress callbacks: the snapshot downloader reports
+/// per-chunk, and forwarding each report spawned a main-actor task and a UI
+/// update — thousands of them over a multi-gigabyte model download.
+private final class DownloadProgressThrottle: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lastReported: Double = -1
+
+    /// Whether `fraction` is worth forwarding to the UI: completion, or a
+    /// change of at least one percentage point since the last report.
+    func shouldReport(_ fraction: Double) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard fraction != lastReported else { return false }
+        guard fraction >= 1 || abs(fraction - lastReported) >= 0.01 else { return false }
+
+        lastReported = fraction
+        return true
+    }
 }
