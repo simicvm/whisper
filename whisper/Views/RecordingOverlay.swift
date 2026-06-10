@@ -14,23 +14,20 @@ struct RecordingOverlayView: View {
 
     private let circleSize = Self.circleDiameter
 
-    /// We accumulate a "phase offset" each frame so that when audio level
+    /// Accumulates a "phase offset" each frame so that when audio level
     /// drops, the animation decelerates smoothly instead of jumping.
-    @State private var accumulatedPhase: Double = 0
-    @State private var lastFrameTime: TimeInterval?
+    /// Stored in a plain reference type (not observed state): TimelineView
+    /// already re-evaluates every frame, so writing an @State property from
+    /// the frame callback would invalidate the view a second time and double
+    /// the per-frame rendering work.
+    @State private var clock = PhaseClock()
 
     var body: some View {
         Group {
             if isVisible {
                 TimelineView(.animation) { context in
                     let time = context.date.timeIntervalSinceReferenceDate
-                    gradientCircle(at: time)
-                        .onChange(of: time) { _, newTime in
-                            advancePhase(at: newTime)
-                        }
-                        .onAppear {
-                            lastFrameTime = time
-                        }
+                    gradientCircle(at: clock.advance(to: time, speed: currentSpeed))
                 }
             }
         }
@@ -44,14 +41,11 @@ struct RecordingOverlayView: View {
     }
 
     @ViewBuilder
-    private func gradientCircle(at time: TimeInterval) -> some View {
-        // On the very first frame, kick off the phase accumulation.
-        let _ = ensureFirstFrame(at: time)
-
+    private func gradientCircle(at phase: Double) -> some View {
         MeshGradient(
             width: 4,
             height: 4,
-            points: meshPoints(at: accumulatedPhase),
+            points: meshPoints(at: phase),
             colors: meshColors
         )
         .frame(width: circleSize * 1.5, height: circleSize * 1.5)
@@ -78,34 +72,27 @@ struct RecordingOverlayView: View {
 
     // MARK: - Phase Accumulation
 
-    /// Advance the accumulated phase based on elapsed time and current speed.
-    private func advancePhase(at time: TimeInterval) {
-        let dt: Double
-        if let last = lastFrameTime {
-            dt = min(time - last, 0.1)
-        } else {
-            dt = 0
-        }
-
-        let speed: Double
+    /// Animation speed driven by the app phase and live audio level.
+    private var currentSpeed: Double {
         if appState.phase == .transcribing {
-            speed = 0.15
-        } else {
-            let level = Double(appState.audioLevel)
-            speed = 0.15 + level * 4.85
+            return 0.15
         }
-
-        accumulatedPhase += dt * speed
-        lastFrameTime = time
+        return 0.15 + Double(appState.audioLevel) * 4.85
     }
 
-    /// Ensures the first frame seeds `lastFrameTime` so `advancePhase`
-    /// has a reference point. Called from within the view builder.
-    private func ensureFirstFrame(at time: TimeInterval) {
-        if lastFrameTime == nil {
-            DispatchQueue.main.async {
-                lastFrameTime = time
-            }
+    /// Integrates phase over time at a variable speed.
+    private final class PhaseClock {
+        private var phase: Double = 0
+        private var lastTime: TimeInterval?
+
+        /// Advance by the elapsed time scaled by `speed` and return the new
+        /// phase. The delta is clamped so gaps (first frame, the view being
+        /// hidden and reshown) don't cause visual jumps.
+        func advance(to time: TimeInterval, speed: Double) -> Double {
+            let dt = lastTime.map { min(max(time - $0, 0), 0.1) } ?? 0
+            phase += dt * speed
+            lastTime = time
+            return phase
         }
     }
 
