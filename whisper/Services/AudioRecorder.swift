@@ -1,3 +1,4 @@
+import Accelerate
 import AVFoundation
 import Foundation
 
@@ -65,13 +66,10 @@ final class AudioRecorder: @unchecked Sendable {
             // Take first channel only
             let bufferPointer = UnsafeBufferPointer(start: channelData[0], count: count)
 
-            // Compute RMS level
+            // Compute RMS level (vectorised; this runs on the audio tap thread)
             if let onLevel = capturedOnLevel {
-                var sumOfSquares: Float = 0
-                for sample in bufferPointer {
-                    sumOfSquares += sample * sample
-                }
-                let rms = sqrtf(sumOfSquares / Float(count))
+                var rms: Float = 0
+                vDSP_rmsqv(bufferPointer.baseAddress!, 1, &rms, vDSP_Length(count))
                 // Normalize: typical speech RMS is ~0.01–0.1, clamp and scale to 0–1
                 let normalized = min(rms * 5.0, 1.0)
                 onLevel(normalized)
