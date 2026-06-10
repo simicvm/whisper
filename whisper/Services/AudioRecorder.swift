@@ -40,6 +40,11 @@ final class AudioRecorder: @unchecked Sendable {
 
         lock.lock()
         nativeSamples.removeAll()
+        // Reserve enough for a typical dictation up front so the audio-thread
+        // tap doesn't repeatedly reallocate-and-copy while appending (a 90s
+        // recording at 48kHz grows to ~4.3M floats). Longer recordings still
+        // grow geometrically beyond this.
+        nativeSamples.reserveCapacity(Int(nativeFormat.sampleRate * min(30, maximumDuration)))
         isRecording = true
         lock.unlock()
 
