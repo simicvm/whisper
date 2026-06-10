@@ -25,6 +25,7 @@ struct WhisperApp: App {
     @State private var recordingTimeoutTask: Task<Void, Never>?
     @State private var hotkeyConfigured = false
     @State private var accessibilityPollTask: Task<Void, Never>?
+    @State private var errorResetTask: Task<Void, Never>?
 
     private static let maxRecordingDurationSeconds = AudioRecorder.defaultMaximumDuration
     private static let minimumSpeechDurationSeconds = 0.2
@@ -527,10 +528,18 @@ struct WhisperApp: App {
 
     // MARK: - Helpers
 
+    /// Returns the app to idle after an error has been visible for `seconds`.
+    /// Only one reset timer is live at a time: a newer error cancels the
+    /// previous timer so it can't clear the new message early.
     @MainActor
     private func resetAfterDelay(seconds: Int = 3) {
-        Task {
-            try? await Task.sleep(for: .seconds(seconds))
+        errorResetTask?.cancel()
+        errorResetTask = Task { @MainActor in
+            do {
+                try await Task.sleep(for: .seconds(seconds))
+            } catch {
+                return
+            }
             if case .error = appState.phase {
                 _ = appState.transition(to: .idle)
             }
