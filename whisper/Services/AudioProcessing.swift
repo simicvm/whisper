@@ -7,6 +7,22 @@ import Foundation
 /// by removing silence and normalising levels before the audio reaches the model.
 enum AudioProcessing {
 
+    /// Outcome of voice-activity analysis on a recording.
+    enum SpeechDetectionResult {
+        /// Speech was found. The associated audio is trimmed to the active
+        /// region (plus pre/post roll) and is safe to gain-normalise.
+        case speech([Float])
+        /// No window cleared the relative speech threshold, but enough signal
+        /// is present that quiet, noisy, or dynamics-compressed speech can't
+        /// be ruled out. The original audio is passed through untouched so
+        /// the model can make the final call; it should not be normalised,
+        /// as that would amplify what may be pure noise.
+        case indeterminate([Float])
+        /// The recording is near-absolute silence (muted or dead microphone,
+        /// nobody speaking). Safe to reject without involving the model.
+        case silence
+    }
+
     // MARK: - Voice Activity Detection (silence trimming)
 
     /// Trim leading and trailing silence from recorded audio using an
@@ -20,26 +36,27 @@ enum AudioProcessing {
     /// 5. Returns the audio between the first and last active windows,
     ///    plus a small pre-roll and post-roll to preserve natural onset/offset.
     ///
-    /// If no window exceeds the speech threshold, `nil` is returned so the
-    /// caller can reject the recording. Passing the audio through instead
-    /// would hand the model pure noise (subsequently gain-normalised), which
-    /// is exactly the input ASR models hallucinate text on.
+    /// When no window exceeds the speech threshold, the result distinguishes
+    /// near-absolute silence (`.silence`, safe to reject — feeding it to the
+    /// model invites hallucinated text) from a merely uncertain recording
+    /// (`.indeterminate`, e.g. low SNR or compressed dynamics, where the
+    /// relative threshold can sit above genuine speech and the model should
+    /// make the final call on the unmodified audio).
     ///
     /// - Parameters:
     ///   - samples: Mono float32 audio samples.
     ///   - sampleRate: Sample rate of `samples` (e.g. 16 000).
-    /// - Returns: A (possibly shorter) slice of the input, or `nil` when no
-    ///   speech was detected.
     static func trimSilence(
         from samples: [Float],
         sampleRate: Double
-    ) -> [Float]? {
+    ) -> SpeechDetectionResult {
         let config = VADConfig()
         let windowSamples = Int(config.windowDuration * sampleRate)
         let hopSamples = Int(config.hopDuration * sampleRate)
 
+        // Too short to analyse — pass through and let the model decide.
         guard windowSamples > 0, hopSamples > 0, samples.count >= windowSamples else {
-            return samples
+            return .indeterminate(samples)
         }
 
         // 1. Compute per-window RMS energy.
@@ -48,7 +65,7 @@ enum AudioProcessing {
             windowSize: windowSamples,
             hopSize: hopSamples
         )
-        guard !energies.isEmpty else { return samples }
+        guard !energies.isEmpty else { return .indeterminate(samples) }
 
         // 2. Estimate the noise floor from the lowest-energy windows.
         let noiseFloor = estimateNoiseFloor(energies: energies, config: config)
@@ -62,8 +79,16 @@ enum AudioProcessing {
         // 4. Find first and last windows above the threshold.
         guard let firstActive = energies.firstIndex(where: { $0 > threshold }),
               let lastActive = energies.lastIndex(where: { $0 > threshold }) else {
-            // No speech detected.
-            return nil
+            // No window cleared the relative threshold. Reject only when the
+            // signal is near-absolute silence; otherwise the recording may be
+            // quiet, noisy, or compressed speech the VAD can't certify — for
+            // a user whose setup always lands here, rejecting would make every
+            // attempt fail, so hand the audio to the model unchanged instead.
+            let maxEnergy = energies.max() ?? 0
+            if maxEnergy < config.absoluteSilenceFloor {
+                return .silence
+            }
+            return .indeterminate(samples)
         }
 
         // 5. Convert window indices to sample indices with pre/post roll.
@@ -73,9 +98,9 @@ enum AudioProcessing {
         let startSample = max(firstActive * hopSamples - preRollSamples, 0)
         let endSample = min(lastActive * hopSamples + windowSamples + postRollSamples, samples.count)
 
-        guard startSample < endSample else { return samples }
+        guard startSample < endSample else { return .speech(samples) }
 
-        return Array(samples[startSample..<endSample])
+        return .speech(Array(samples[startSample..<endSample]))
     }
 
     // MARK: - Gain Normalisation
@@ -124,6 +149,11 @@ enum AudioProcessing {
         let thresholdMultiplier: Float = 3.0
         /// Absolute minimum RMS threshold — prevents false positives in pure silence.
         let minimumThreshold: Float = 0.005
+        /// Window RMS below which the whole recording counts as silent when
+        /// no window clears the speech threshold. Kept well under
+        /// `minimumThreshold` so quiet-but-real speech is handed to the model
+        /// (as `.indeterminate`) rather than rejected.
+        let absoluteSilenceFloor: Float = 0.002
         /// Audio to keep before the first detected speech.
         let preRollDuration: Double = 0.1  // 100 ms
         /// Audio to keep after the last detected speech.

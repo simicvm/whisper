@@ -300,22 +300,36 @@ struct WhisperApp: App {
         overlayManager.show(appState: appState)
 
         do {
-            // Trim leading/trailing silence before inference. A nil result
-            // means the VAD found no speech at all — reject the recording
-            // rather than amplifying noise and inviting hallucinated text.
-            let trimmed = AudioProcessing.trimSilence(
+            // Trim leading/trailing silence before inference. Only confident
+            // near-silence is rejected outright; uncertain audio (quiet,
+            // noisy, or compressed speech the VAD can't certify) goes to the
+            // model unmodified so it can make the final call.
+            let processed: [Float]
+            switch AudioProcessing.trimSilence(
                 from: rawSamples,
                 sampleRate: Self.transcriptionSampleRate
-            )
+            ) {
+            case .silence:
+                overlayManager.hide()
+                _ = appState.transition(to: .error("No speech detected. Hold the hotkey, speak, then release."))
+                resetAfterDelay(seconds: 2)
+                return
+            case .speech(let trimmed):
+                processed = AudioProcessing.normalizeGain(trimmed)
+            case .indeterminate(let audio):
+                // Deliberately not normalised: boosting what may be pure
+                // noise to peak level invites hallucinated transcriptions.
+                processed = audio
+            }
 
-            guard let trimmed, trimmed.count >= minimumSamples else {
+            // The active region may be shorter than the minimum after trimming.
+            guard processed.count >= minimumSamples else {
                 overlayManager.hide()
                 _ = appState.transition(to: .error("No speech detected. Hold the hotkey, speak, then release."))
                 resetAfterDelay(seconds: 2)
                 return
             }
 
-            let processed = AudioProcessing.normalizeGain(trimmed)
             let text = try await transcriptionService.transcribe(audio: processed)
 
             _ = appState.transition(to: .pasting)
