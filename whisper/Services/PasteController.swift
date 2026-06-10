@@ -19,6 +19,10 @@ struct PasteController {
     /// application reliably registers the keystroke.
     private static let keyEventGap: Duration = .milliseconds(10)
 
+    /// Maximum time to wait for physically held modifier keys to be released
+    /// before simulating Cmd+V anyway.
+    private static let modifierReleaseTimeout: Duration = .seconds(2)
+
     /// Paste text into the active application.
     /// Saves and restores the original clipboard contents.
     static func paste(_ text: String) async throws {
@@ -49,6 +53,13 @@ struct PasteController {
 
         // Small delay to ensure pasteboard is updated
         try? await Task.sleep(for: pasteboardSettleDelay)
+
+        // The push-to-talk combo is modifier-based, so for fast transcriptions
+        // (or the max-duration timeout) we can get here while the user still
+        // holds part of the combo. The hardware modifier state can then merge
+        // into the synthetic keystroke — the target app sees e.g. ⌃⌘V instead
+        // of ⌘V and the paste silently does nothing. Wait for a clean state.
+        await waitForPhysicalModifierRelease()
 
         // Simulate Cmd+V keystroke. On failure, deliberately skip the
         // restore: the transcription would otherwise be lost entirely.
@@ -199,6 +210,25 @@ struct PasteController {
 
         if !restoredItems.isEmpty {
             pasteboard.writeObjects(restoredItems)
+        }
+    }
+
+    /// Wait (bounded by `modifierReleaseTimeout`) until no modifier keys are
+    /// physically held. Caps Lock is excluded: its flag reflects the latched
+    /// lock state, not a held key, and would stall every paste while enabled.
+    private static func waitForPhysicalModifierRelease() async {
+        let watched: CGEventFlags = [
+            .maskCommand, .maskShift, .maskControl, .maskAlternate, .maskSecondaryFn,
+        ]
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: modifierReleaseTimeout)
+
+        while clock.now < deadline {
+            let flags = CGEventSource.flagsState(.combinedSessionState)
+            if flags.intersection(watched).isEmpty {
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(20))
         }
     }
 
