@@ -35,6 +35,13 @@ struct PasteController {
         let finalText = shouldPrependSpace() ? " \(text)" : text
 
         guard writeText(finalText, to: pasteboard) else {
+            // Nothing useful is on the pasteboard now (write cleared it),
+            // so put the user's original contents back.
+            restorePasteboard(
+                snapshot,
+                to: pasteboard,
+                expectedChangeCount: pasteboard.changeCount
+            )
             throw PasteError.pasteboardWriteFailed
         }
 
@@ -43,17 +50,10 @@ struct PasteController {
         // Small delay to ensure pasteboard is updated
         try? await Task.sleep(for: pasteboardSettleDelay)
 
-        // Simulate Cmd+V keystroke
-        do {
-            try await simulateCmdV()
-        } catch {
-            restorePasteboard(
-                snapshot,
-                to: pasteboard,
-                expectedChangeCount: stagedChangeCount
-            )
-            throw error
-        }
+        // Simulate Cmd+V keystroke. On failure, deliberately skip the
+        // restore: the transcription would otherwise be lost entirely.
+        // Leaving it on the pasteboard lets the user paste it manually.
+        try await simulateCmdV()
 
         // Restore original pasteboard after paste completes
         try? await Task.sleep(for: pasteCompletionDelay)
@@ -257,7 +257,7 @@ enum PasteError: LocalizedError {
         case .pasteboardWriteFailed:
             return "Unable to write text to the pasteboard"
         case .keyEventCreationFailed:
-            return "Unable to synthesize Cmd+V key events"
+            return "Could not simulate Cmd+V. The text is on your clipboard — paste it manually."
         }
     }
 }
