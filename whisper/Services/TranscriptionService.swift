@@ -4,13 +4,14 @@ import MLXAudioSTT
 import MLXAudioCore
 import HuggingFace
 
-/// Wraps Qwen3ASRModel for loading and transcribing audio.
+/// Loads MLXAudioSTT speech-to-text models and transcribes audio with them.
 ///
 /// The actor isolates model ownership and serializes operations.
 /// Inference itself runs on a dedicated queue so long synchronous
 /// `model.generate(...)` work does not execute on Swift's cooperative executor.
 actor TranscriptionService {
-    private var model: Qwen3ASRModel?
+    private var model: (any STTGenerationModel)?
+    private var generationParameters: STTGenerateParameters?
     private var currentRepoID: String?
 
     /// Guards stale completions for actor-owned model state.
@@ -30,7 +31,8 @@ actor TranscriptionService {
 
     // Safe: immutable payload; model access is serialized by acquireOperationTurn.
     private struct InferenceRequest: @unchecked Sendable {
-        let model: Qwen3ASRModel
+        let model: any STTGenerationModel
+        let parameters: STTGenerateParameters
         let audio: [Float]
     }
 
@@ -41,8 +43,9 @@ actor TranscriptionService {
     func downloadedModelRepoIDs(for repoIDs: [String]) async -> Set<String> {
         var downloaded: Set<String> = []
         for repoID in repoIDs {
+            guard let definition = STTModelDefinition.find(repoID: repoID) else { continue }
             let modelDir = Self.modelDirectory(for: repoID)
-            if await Self.hasCompleteModelSnapshot(at: modelDir) {
+            if await Self.hasCompleteModelSnapshot(at: modelDir, family: definition.family) {
                 downloaded.insert(repoID)
             }
         }
@@ -68,7 +71,7 @@ actor TranscriptionService {
         try FileManager.default.removeItem(at: modelDir)
     }
 
-    /// Load a Qwen3 ASR model from a HuggingFace repo.
+    /// Load an STT model from a HuggingFace repo.
     /// Downloads on first use, cached locally for subsequent launches.
     func loadModel(
         repoID: String,
@@ -78,6 +81,10 @@ actor TranscriptionService {
         await acquireOperationTurn()
         defer { releaseOperationTurn() }
         try Task.checkCancellation()
+
+        guard let definition = STTModelDefinition.find(repoID: repoID) else {
+            throw TranscriptionError.unsupportedModel(repoID)
+        }
 
         // Skip if already loaded with same model
         if currentRepoID == repoID && model != nil {
@@ -90,13 +97,13 @@ actor TranscriptionService {
 
         try Task.checkCancellation()
 
-        try await Self.ensureModelSnapshot(repoID: repoID, updateHandler: updateHandler)
+        try await Self.ensureModelSnapshot(for: definition, updateHandler: updateHandler)
 
         try Task.checkCancellation()
 
         await updateHandler?(.initializing)
 
-        let loaded = try await Qwen3ASRModel.fromPretrained(repoID)
+        let loaded = try await Self.loadPretrainedModel(for: definition)
 
         try Task.checkCancellation()
         guard generation == loadGeneration else {
@@ -104,21 +111,44 @@ actor TranscriptionService {
         }
 
         model = loaded
+        generationParameters = Self.generationParameters(for: definition.family)
         currentRepoID = repoID
+    }
+
+    private static func loadPretrainedModel(
+        for definition: STTModelDefinition
+    ) async throws -> any STTGenerationModel {
+        switch definition.family {
+        case .qwen3:
+            return try await Qwen3ASRModel.fromPretrained(definition.repoID)
+        case .nemotron:
+            return try await NemotronASRModel.fromPretrained(definition.repoID)
+        }
+    }
+
+    private static func generationParameters(for family: STTModelFamily) -> STTGenerateParameters {
+        switch family {
+        case .qwen3:
+            return STTGenerateParameters(language: "English")
+        case .nemotron:
+            // A nil language defers to the checkpoint's default_language
+            // ("auto"), enabling Nemotron's built-in language detection.
+            return STTGenerateParameters()
+        }
     }
 
     /// Ensures required model files exist in the model cache directory.
     /// This emits explicit download progress so UI can distinguish download
     /// from later model initialization.
     private static func ensureModelSnapshot(
-        repoID: String,
+        for definition: STTModelDefinition,
         updateHandler: (@MainActor @Sendable (ModelLoadUpdate) -> Void)? = nil
     ) async throws {
-        let modelDir = modelDirectory(for: repoID)
-        guard !(await hasCompleteModelSnapshot(at: modelDir)) else { return }
+        let modelDir = modelDirectory(for: definition.repoID)
+        guard !(await hasCompleteModelSnapshot(at: modelDir, family: definition.family)) else { return }
 
-        guard let hfRepoID = Repo.ID(rawValue: repoID) else {
-            throw TranscriptionError.invalidRepositoryID(repoID)
+        guard let hfRepoID = Repo.ID(rawValue: definition.repoID) else {
+            throw TranscriptionError.invalidRepositoryID(definition.repoID)
         }
 
         await updateHandler?(.downloading(progress: 0))
@@ -133,7 +163,7 @@ actor TranscriptionService {
             kind: .model,
             to: modelDir,
             revision: "main",
-            matching: ["*.safetensors", "*.json", "merges.txt"],
+            matching: definition.family.downloadFilePatterns,
             progressHandler: { progress in
                 let fraction = progress.fractionCompleted
                 let normalized =
@@ -149,7 +179,7 @@ actor TranscriptionService {
 
         // Keep going even if our local snapshot predicate fails so upstream
         // fromPretrained() can resolve/download via its own cache strategy.
-        _ = await hasCompleteModelSnapshot(at: modelDir)
+        _ = await hasCompleteModelSnapshot(at: modelDir, family: definition.family)
 
         await updateHandler?(.downloading(progress: 1))
     }
@@ -164,15 +194,15 @@ actor TranscriptionService {
             .appendingPathComponent(modelSubdir)
     }
 
-    private static func hasCompleteModelSnapshot(at modelDir: URL) async -> Bool {
+    private static func hasCompleteModelSnapshot(at modelDir: URL, family: STTModelFamily) async -> Bool {
         await withCheckedContinuation { continuation in
             cacheInspectionQueue.async {
-                continuation.resume(returning: hasCompleteModelSnapshotSync(at: modelDir))
+                continuation.resume(returning: hasCompleteModelSnapshotSync(at: modelDir, family: family))
             }
         }
     }
 
-    private static func hasCompleteModelSnapshotSync(at modelDir: URL) -> Bool {
+    private static func hasCompleteModelSnapshotSync(at modelDir: URL, family: STTModelFamily) -> Bool {
         guard FileManager.default.fileExists(atPath: modelDir.path) else {
             return false
         }
@@ -183,9 +213,11 @@ actor TranscriptionService {
         )) ?? []
 
         let hasWeights = files.contains { $0.pathExtension == "safetensors" }
-        let hasMerges = FileManager.default.fileExists(
-            atPath: modelDir.appendingPathComponent("merges.txt").path
-        )
+        let hasAuxiliaryFiles = family.requiredAuxiliaryFiles.allSatisfy { fileName in
+            FileManager.default.fileExists(
+                atPath: modelDir.appendingPathComponent(fileName).path
+            )
+        }
         let configPath = modelDir.appendingPathComponent("config.json")
         let hasValidConfig =
             FileManager.default.fileExists(atPath: configPath.path)
@@ -196,7 +228,7 @@ actor TranscriptionService {
                 return (try? JSONSerialization.jsonObject(with: data)) != nil
             }()
 
-        return hasWeights && hasMerges && hasValidConfig
+        return hasWeights && hasAuxiliaryFiles && hasValidConfig
     }
 
     /// Transcribe raw audio samples to text.
@@ -208,7 +240,7 @@ actor TranscriptionService {
         defer { releaseOperationTurn() }
         try Task.checkCancellation()
 
-        guard let model else {
+        guard let model, let generationParameters else {
             throw TranscriptionError.modelNotLoaded
         }
 
@@ -218,7 +250,11 @@ actor TranscriptionService {
 
         try Task.checkCancellation()
 
-        let text = await runInference(model: model, audio: audio)
+        let text = await runInference(
+            model: model,
+            parameters: generationParameters,
+            audio: audio
+        )
 
         try Task.checkCancellation()
 
@@ -232,6 +268,7 @@ actor TranscriptionService {
     private func invalidateLoadedModel() {
         loadGeneration &+= 1
         model = nil
+        generationParameters = nil
         currentRepoID = nil
         Memory.clearCache()
     }
@@ -257,15 +294,19 @@ actor TranscriptionService {
         next.resume()
     }
 
-    private func runInference(model: Qwen3ASRModel, audio: [Float]) async -> String {
-        let request = InferenceRequest(model: model, audio: audio)
+    private func runInference(
+        model: any STTGenerationModel,
+        parameters: STTGenerateParameters,
+        audio: [Float]
+    ) async -> String {
+        let request = InferenceRequest(model: model, parameters: parameters, audio: audio)
 
         return await withCheckedContinuation { continuation in
             inferenceQueue.async {
                 let mlxAudio = MLXArray(request.audio)
                 let output = request.model.generate(
                     audio: mlxAudio,
-                    language: "English"
+                    generationParameters: request.parameters
                 )
                 let text = output.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 continuation.resume(returning: text)
@@ -279,6 +320,7 @@ enum TranscriptionError: LocalizedError {
     case emptyAudio
     case emptyResult
     case invalidRepositoryID(String)
+    case unsupportedModel(String)
 
     var errorDescription: String? {
         switch self {
@@ -290,6 +332,8 @@ enum TranscriptionError: LocalizedError {
             return "No speech detected"
         case .invalidRepositoryID(let repoID):
             return "Invalid model repository ID: \(repoID)"
+        case .unsupportedModel(let repoID):
+            return "Unsupported model: \(repoID)"
         }
     }
 }
