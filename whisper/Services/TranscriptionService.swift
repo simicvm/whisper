@@ -131,9 +131,10 @@ actor TranscriptionService {
         case .qwen3:
             return STTGenerateParameters(language: "English")
         case .nemotron:
-            // A nil language defers to the checkpoint's default_language
-            // ("auto"), enabling Nemotron's built-in language detection.
-            return STTGenerateParameters()
+            // Must be a prompt_dictionary key from the checkpoint config
+            // ("en", not "English"); unrecognized keys silently fall back
+            // to "auto" language detection.
+            return STTGenerateParameters(language: "en")
         }
     }
 
