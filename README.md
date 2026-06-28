@@ -48,6 +48,48 @@ All processing runs locally using [Qwen3 ASR](https://huggingface.co/collections
 > xattr -dr com.apple.quarantine /Applications/whisper.app
 > ```
 
+## Release
+
+1. Start from a clean, pushed `main` branch:
+   ```
+   git checkout main
+   git pull --ff-only
+   git status --short
+   ```
+
+2. Build the Release app bundle, unless you already have the final app in `build/Build/Products/Release/whisper.app`:
+   ```
+   xcodebuild -project whisper.xcodeproj -scheme whisper -configuration Release -derivedDataPath build clean build
+   ```
+
+3. Package the app and record the checksum:
+   ```
+   VERSION=0.2.5
+   ditto -c -k --sequesterRsrc --keepParent \
+     build/Build/Products/Release/whisper.app \
+     "/tmp/whisper-v${VERSION}-macos.zip"
+   shasum -a 256 "/tmp/whisper-v${VERSION}-macos.zip"
+   ```
+
+4. Create and push the tag:
+   ```
+   git tag "v${VERSION}"
+   git push origin "v${VERSION}"
+   ```
+
+5. Create the GitHub release and upload the zip:
+   ```
+   gh release create "v${VERSION}" \
+     "/tmp/whisper-v${VERSION}-macos.zip#whisper-v${VERSION}-macos.zip" \
+     --title "v${VERSION}" \
+     --notes "Summarize the user-visible changes."
+   ```
+
+6. Verify the published asset:
+   ```
+   gh release view "v${VERSION}" --json tagName,isDraft,isPrerelease,assets
+   ```
+
 ## How It Works
 
 1. A global CGEvent tap listens for the configured key combination (left/right modifier aware).
