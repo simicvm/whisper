@@ -6,6 +6,7 @@ import Foundation
 enum STTModelFamily {
     case qwen3
     case nemotron
+    case parakeet
 
     /// Glob patterns passed to the HuggingFace snapshot download.
     var downloadFilePatterns: [String] {
@@ -15,6 +16,9 @@ enum STTModelFamily {
         case .nemotron:
             // The vocabulary and prompt tables are embedded in config.json;
             // there is no separate tokenizer artifact to fetch.
+            return ["*.safetensors", "*.json"]
+        case .parakeet:
+            // Parakeet stores vocabulary/decoder metadata in config.json.
             return ["*.safetensors", "*.json"]
         }
     }
@@ -26,6 +30,8 @@ enum STTModelFamily {
         case .qwen3:
             return ["merges.txt"]
         case .nemotron:
+            return []
+        case .parakeet:
             return []
         }
     }
@@ -62,6 +68,18 @@ struct STTModelDefinition: Identifiable, Hashable {
             displayName: "Nemotron 3.5 ASR 0.6B (8-bit)",
             repoID: "mlx-community/nemotron-3.5-asr-streaming-0.6b-8bit",
             family: .nemotron
+        ),
+        STTModelDefinition(
+            id: "parakeet-tdt-0.6b-v2",
+            displayName: "Parakeet TDT 0.6B v2",
+            repoID: "mlx-community/parakeet-tdt-0.6b-v2",
+            family: .parakeet
+        ),
+        STTModelDefinition(
+            id: "parakeet-tdt-0.6b-v3",
+            displayName: "Parakeet TDT 0.6B v3 (multilingual)",
+            repoID: "mlx-community/parakeet-tdt-0.6b-v3",
+            family: .parakeet
         ),
     ]
 

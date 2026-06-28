@@ -2,12 +2,12 @@
 
 A macOS menu bar app for on-device speech-to-text. Hold a hotkey, speak, release — transcribed text is pasted into the active application automatically.
 
-All processing runs locally using [Qwen3 ASR](https://huggingface.co/collections/mlx-community/qwen3-audio-6848a88a82aeef3874bf1543) and [Nemotron 3.5 ASR](https://huggingface.co/mlx-community/nemotron-3.5-asr-streaming-0.6b-8bit) models via Apple's MLX framework. No audio leaves your machine.
+All processing runs locally using [Qwen3 ASR](https://huggingface.co/collections/mlx-community/qwen3-audio-6848a88a82aeef3874bf1543), [Nemotron 3.5 ASR](https://huggingface.co/mlx-community/nemotron-3.5-asr-streaming-0.6b-8bit), and [Parakeet TDT](https://huggingface.co/mlx-community/parakeet-tdt-0.6b-v3) models via Apple's MLX framework. No audio leaves your machine.
 
 ## Features
 
 - **Push-to-talk hotkey** — configurable custom key combinations (including left/right modifiers) with global detection via a CGEvent tap
-- **Multiple model options** — Qwen3 ASR 0.6B (8-bit), 1.7B (8-bit), 1.7B (4-bit), and Nemotron 3.5 ASR 0.6B (8-bit) with on-demand downloading and per-model cache management
+- **Multiple model options** — Qwen3 ASR, Nemotron 3.5 ASR, and Parakeet TDT v2/v3 with on-demand downloading and per-model cache management
 - **Smart paste** — transcribed text is written to the pasteboard, Cmd+V is simulated via Accessibility, and the original clipboard contents are restored afterward; a space is prepended when the cursor follows non-whitespace
 - **Visual feedback** — animated floating overlay with a MeshGradient whose speed responds to real-time audio level
 - **Menu bar UI** — model selector with download/delete controls, permission status indicators, inline hotkey capture, and run-on-startup toggle

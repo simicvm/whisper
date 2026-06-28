@@ -123,6 +123,8 @@ actor TranscriptionService {
             return try await Qwen3ASRModel.fromPretrained(definition.repoID)
         case .nemotron:
             return try await NemotronASRModel.fromPretrained(definition.repoID)
+        case .parakeet:
+            return try await ParakeetModel.fromPretrained(definition.repoID)
         }
     }
 
@@ -134,6 +136,8 @@ actor TranscriptionService {
             // Must be a prompt_dictionary key from the checkpoint config
             // ("en", not "English"); unrecognized keys silently fall back
             // to "auto" language detection.
+            return STTGenerateParameters(language: "en")
+        case .parakeet:
             return STTGenerateParameters(language: "en")
         }
     }
