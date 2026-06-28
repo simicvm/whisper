@@ -67,7 +67,7 @@ struct STTModelDefinition: Identifiable, Hashable {
         ),
         STTModelDefinition(
             id: "parakeet-tdt-0.6b-v3",
-            displayName: "Parakeet TDT 0.6B v3 (multilingual)",
+            displayName: "Parakeet TDT 0.6B v3",
             repoID: "mlx-community/parakeet-tdt-0.6b-v3",
             family: .parakeet
         ),
