@@ -83,6 +83,7 @@ struct MenuBarView: View {
 
         ForEach(STTModelDefinition.allModels) { model in
             let isDownloaded = appState.downloadedModelRepoIDs.contains(model.repoID)
+            let isRemovable = appState.removableModelRepoIDs.contains(model.repoID)
             let isSelectedDownloadedModel =
                 appState.selectedModelID == model.repoID && isDownloaded
             let isHoveringDelete = hoveredDeleteModelID == model.repoID
@@ -122,7 +123,7 @@ struct MenuBarView: View {
                     }
                 }
 
-                if isDownloaded {
+                if isRemovable {
                     Button {
                         onDeleteLocalModel(model)
                     } label: {
@@ -137,7 +138,7 @@ struct MenuBarView: View {
                     }
                     .buttonStyle(.plain)
                     .disabled(isModelInteractionDisabled)
-                    .help("Delete local model files")
+                    .help("Delete local model cache")
                     .onHover { isHovering in
                         if isHovering {
                             hoveredDeleteModelID = model.repoID
@@ -145,7 +146,9 @@ struct MenuBarView: View {
                             hoveredDeleteModelID = nil
                         }
                     }
-                } else {
+                }
+
+                if !isDownloaded {
                     Button {
                         onModelSelect(model)
                     } label: {

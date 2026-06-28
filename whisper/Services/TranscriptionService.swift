@@ -52,7 +52,17 @@ actor TranscriptionService {
         return downloaded
     }
 
-    /// Deletes a specific local model snapshot.
+    /// Returns repo IDs that have any app-managed cache artifacts to remove.
+    func removableModelRepoIDs(for repoIDs: [String]) async -> Set<String> {
+        var removable: Set<String> = []
+        for repoID in repoIDs where await Self.hasRemovableCache(for: repoID) {
+            removable.insert(repoID)
+        }
+        return removable
+    }
+
+    /// Deletes a specific local model snapshot and any Hugging Face cache entries
+    /// that may have been created by older download paths.
     func deleteLocalModel(repoID: String) async throws {
         try Task.checkCancellation()
         await acquireOperationTurn()
@@ -63,12 +73,9 @@ actor TranscriptionService {
             invalidateLoadedModel()
         }
 
-        let modelDir = Self.modelDirectory(for: repoID)
-        guard FileManager.default.fileExists(atPath: modelDir.path) else {
-            return
+        for cachePath in Self.cachePathsToDelete(for: repoID) {
+            try Self.removeItemIfExists(at: cachePath)
         }
-
-        try FileManager.default.removeItem(at: modelDir)
     }
 
     /// Load an STT model from a HuggingFace repo.
@@ -161,25 +168,11 @@ actor TranscriptionService {
         // Create directory if needed (first-time download case)
         try FileManager.default.createDirectory(at: modelDir, withIntermediateDirectories: true)
 
-        let client = HubClient.default
-        let progressThrottle = DownloadProgressThrottle()
-        _ = try await client.downloadSnapshot(
-            of: hfRepoID,
-            kind: .model,
+        try await downloadModelFiles(
+            for: definition,
+            repo: hfRepoID,
             to: modelDir,
-            revision: "main",
-            matching: definition.family.downloadFilePatterns,
-            progressHandler: { progress in
-                let fraction = progress.fractionCompleted
-                let normalized =
-                    fraction.isFinite ? min(max(fraction, 0), 1) : 0
-                guard let updateHandler, progressThrottle.shouldReport(normalized) else {
-                    return
-                }
-                Task { @MainActor in
-                    updateHandler(.downloading(progress: normalized))
-                }
-            }
+            updateHandler: updateHandler
         )
 
         // Keep going even if our local snapshot predicate fails so upstream
@@ -194,9 +187,189 @@ actor TranscriptionService {
         // If upstream cache layout changes, ensureModelSnapshot falls back to
         // fromPretrained()'s resolver instead of failing hard.
         let modelSubdir = repoID.replacingOccurrences(of: "/", with: "_")
+        return HubCache.default.cacheDirectory
+            .appendingPathComponent("mlx-audio")
+            .appendingPathComponent(modelSubdir)
+    }
+
+    private static func legacyModelDirectory(for repoID: String) -> URL {
+        let modelSubdir = repoID.replacingOccurrences(of: "/", with: "_")
         return URL.cachesDirectory
             .appendingPathComponent("mlx-audio")
             .appendingPathComponent(modelSubdir)
+    }
+
+    private static func cachePathsToDelete(for repoID: String) -> [URL] {
+        var paths = [
+            modelDirectory(for: repoID),
+            legacyModelDirectory(for: repoID),
+        ]
+
+        if let hfRepoID = Repo.ID(rawValue: repoID) {
+            let cache = HubCache.default
+            let repoDirectory = cache.repoDirectory(repo: hfRepoID, kind: .model)
+            paths.append(repoDirectory)
+            paths.append(cache.metadataDirectory(repo: hfRepoID, kind: .model))
+            paths.append(cache.lockPath(for: repoDirectory))
+        }
+
+        var seen = Set<String>()
+        return paths.filter { url in
+            seen.insert(url.standardizedFileURL.path).inserted
+        }
+    }
+
+    private static func removeItemIfExists(at url: URL) throws {
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        try FileManager.default.removeItem(at: url)
+    }
+
+    private static func hasRemovableCache(for repoID: String) async -> Bool {
+        await withCheckedContinuation { continuation in
+            cacheInspectionQueue.async {
+                let hasCache = cachePathsToDelete(for: repoID).contains { cachePath in
+                    FileManager.default.fileExists(atPath: cachePath.path)
+                }
+                continuation.resume(returning: hasCache)
+            }
+        }
+    }
+
+    private static func downloadModelFiles(
+        for definition: STTModelDefinition,
+        repo: Repo.ID,
+        to modelDir: URL,
+        updateHandler: (@MainActor @Sendable (ModelLoadUpdate) -> Void)?
+    ) async throws {
+        let client = HubClient.default
+        let entries = try await client.listFiles(
+            in: repo,
+            kind: .model,
+            revision: "main",
+            recursive: true
+        )
+        let files = try entries
+            .filter { entry in
+                entry.type == .file && matchesDownloadPatterns(
+                    path: entry.path,
+                    patterns: definition.family.downloadFilePatterns
+                )
+            }
+            .map { entry in
+                try ModelDownloadFile(
+                    entry: entry,
+                    destination: modelFileDestination(for: entry.path, in: modelDir)
+                )
+            }
+
+        guard !files.isEmpty else {
+            throw TranscriptionError.noDownloadableModelFiles(definition.repoID)
+        }
+
+        let totalBytes = max(files.reduce(Int64(0)) { $0 + $1.weight }, 1)
+        let progressThrottle = DownloadProgressThrottle()
+        var completedBytes = files.reduce(Int64(0)) { partial, file in
+            partial + (isCompleteLocalFile(file) ? file.weight : 0)
+        }
+        reportModelDownloadProgress(
+            completedBytes: completedBytes,
+            totalBytes: totalBytes,
+            throttle: progressThrottle,
+            updateHandler: updateHandler
+        )
+
+        let bearerToken = await client.bearerToken
+
+        for file in files where !isCompleteLocalFile(file) {
+            try Task.checkCancellation()
+            let completedBeforeFile = completedBytes
+            var request = URLRequest(url: downloadURL(for: file.entry.path, repo: repo, host: client.host))
+            request.httpMethod = "GET"
+            request.cachePolicy = .reloadIgnoringLocalCacheData
+            if let userAgent = client.userAgent {
+                request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+            }
+            if let bearerToken {
+                request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
+            }
+
+            try await ModelFileDownloader.download(request: request, to: file.destination) { downloadedBytes, _ in
+                let currentBytes = min(max(downloadedBytes, 0), file.weight)
+                reportModelDownloadProgress(
+                    completedBytes: completedBeforeFile + currentBytes,
+                    totalBytes: totalBytes,
+                    throttle: progressThrottle,
+                    updateHandler: updateHandler
+                )
+            }
+
+            completedBytes += file.weight
+            reportModelDownloadProgress(
+                completedBytes: completedBytes,
+                totalBytes: totalBytes,
+                throttle: progressThrottle,
+                updateHandler: updateHandler
+            )
+        }
+    }
+
+    private static func matchesDownloadPatterns(path: String, patterns: [String]) -> Bool {
+        guard !patterns.isEmpty else { return true }
+        return patterns.contains { pattern in
+            if pattern.hasPrefix("*") {
+                return path.hasSuffix(String(pattern.dropFirst()))
+            }
+            return path == pattern
+        }
+    }
+
+    private static func modelFileDestination(for path: String, in modelDir: URL) throws -> URL {
+        let components = path.split(separator: "/").map(String.init)
+        guard !path.hasPrefix("/"),
+            !components.isEmpty,
+            components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." })
+        else {
+            throw TranscriptionError.unsafeModelFilePath(path)
+        }
+
+        return components.reduce(modelDir) { partial, component in
+            partial.appendingPathComponent(component)
+        }
+    }
+
+    private static func downloadURL(for path: String, repo: Repo.ID, host: URL) -> URL {
+        host
+            .appending(path: repo.namespace)
+            .appending(path: repo.name)
+            .appending(path: "resolve")
+            .appending(component: "main")
+            .appending(path: path)
+    }
+
+    private static func isCompleteLocalFile(_ file: ModelDownloadFile) -> Bool {
+        guard let localSize = localFileSize(at: file.destination) else { return false }
+        guard let expectedSize = file.expectedSize else { return false }
+        return localSize == expectedSize
+    }
+
+    private static func localFileSize(at url: URL) -> Int64? {
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        return (attributes?[.size] as? NSNumber)?.int64Value
+    }
+
+    private static func reportModelDownloadProgress(
+        completedBytes: Int64,
+        totalBytes: Int64,
+        throttle: DownloadProgressThrottle,
+        updateHandler: (@MainActor @Sendable (ModelLoadUpdate) -> Void)?
+    ) {
+        let fraction = Double(completedBytes) / Double(max(totalBytes, 1))
+        let normalized = fraction.isFinite ? min(max(fraction, 0), 1) : 0
+        guard let updateHandler, throttle.shouldReport(normalized) else { return }
+        Task { @MainActor in
+            updateHandler(.downloading(progress: normalized))
+        }
     }
 
     private static func hasCompleteModelSnapshot(at modelDir: URL, family: STTModelFamily) async -> Bool {
@@ -326,6 +499,9 @@ enum TranscriptionError: LocalizedError {
     case emptyResult
     case invalidRepositoryID(String)
     case unsupportedModel(String)
+    case noDownloadableModelFiles(String)
+    case unsafeModelFilePath(String)
+    case modelDownloadFailed(String, Int)
 
     var errorDescription: String? {
         switch self {
@@ -339,6 +515,12 @@ enum TranscriptionError: LocalizedError {
             return "Invalid model repository ID: \(repoID)"
         case .unsupportedModel(let repoID):
             return "Unsupported model: \(repoID)"
+        case .noDownloadableModelFiles(let repoID):
+            return "No downloadable model files found for \(repoID)"
+        case .unsafeModelFilePath(let path):
+            return "Unsafe model file path: \(path)"
+        case .modelDownloadFailed(let path, let statusCode):
+            return "Failed to download \(path) (HTTP \(statusCode))"
         }
     }
 }
@@ -348,9 +530,150 @@ enum ModelLoadUpdate: Sendable {
     case initializing
 }
 
-/// Rate-limits download progress callbacks: the snapshot downloader reports
-/// per-chunk, and forwarding each report spawned a main-actor task and a UI
-/// update — thousands of them over a multi-gigabyte model download.
+private struct ModelDownloadFile: Sendable {
+    let entry: Git.TreeEntry
+    let destination: URL
+
+    var expectedSize: Int64? {
+        entry.size.map(Int64.init)
+    }
+
+    var weight: Int64 {
+        max(expectedSize ?? 1, 1)
+    }
+}
+
+private final class ModelFileDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+    private let destination: URL
+    private let progressHandler: @Sendable (Int64, Int64) -> Void
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<URL, Error>?
+    private var task: URLSessionDownloadTask?
+    private var session: URLSession?
+    private var finished = false
+    private var cancelled = false
+
+    private init(
+        destination: URL,
+        progressHandler: @escaping @Sendable (Int64, Int64) -> Void
+    ) {
+        self.destination = destination
+        self.progressHandler = progressHandler
+    }
+
+    static func download(
+        request: URLRequest,
+        to destination: URL,
+        progressHandler: @escaping @Sendable (Int64, Int64) -> Void
+    ) async throws -> URL {
+        let downloader = ModelFileDownloader(
+            destination: destination,
+            progressHandler: progressHandler
+        )
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                downloader.start(request: request, continuation: continuation)
+            }
+        } onCancel: {
+            downloader.cancel()
+        }
+    }
+
+    private func start(request: URLRequest, continuation: CheckedContinuation<URL, Error>) {
+        let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+        let task = session.downloadTask(with: request)
+
+        lock.lock()
+        self.session = session
+        self.task = task
+        self.continuation = continuation
+        lock.unlock()
+
+        task.resume()
+    }
+
+    private func cancel() {
+        lock.lock()
+        cancelled = true
+        let task = task
+        lock.unlock()
+
+        task?.cancel()
+    }
+
+    func urlSession(
+        _: URLSession,
+        downloadTask _: URLSessionDownloadTask,
+        didWriteData _: Int64,
+        totalBytesWritten: Int64,
+        totalBytesExpectedToWrite: Int64
+    ) {
+        progressHandler(totalBytesWritten, totalBytesExpectedToWrite)
+    }
+
+    func urlSession(
+        _: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didFinishDownloadingTo location: URL
+    ) {
+        guard let httpResponse = downloadTask.response as? HTTPURLResponse else {
+            finish(.failure(TranscriptionError.modelDownloadFailed(destination.lastPathComponent, -1)))
+            return
+        }
+
+        guard (200 ..< 300).contains(httpResponse.statusCode) else {
+            finish(.failure(TranscriptionError.modelDownloadFailed(destination.lastPathComponent, httpResponse.statusCode)))
+            return
+        }
+
+        do {
+            try FileManager.default.createDirectory(
+                at: destination.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try? FileManager.default.removeItem(at: destination)
+            try FileManager.default.moveItem(at: location, to: destination)
+            finish(.success(destination))
+        } catch {
+            finish(.failure(error))
+        }
+    }
+
+    func urlSession(
+        _: URLSession,
+        task _: URLSessionTask,
+        didCompleteWithError error: Error?
+    ) {
+        guard let error else { return }
+
+        lock.lock()
+        let wasCancelled = cancelled
+        lock.unlock()
+
+        finish(.failure(wasCancelled ? CancellationError() : error))
+    }
+
+    private func finish(_ result: Result<URL, Error>) {
+        lock.lock()
+        guard !finished else {
+            lock.unlock()
+            return
+        }
+        finished = true
+        let continuation = continuation
+        let session = session
+        self.continuation = nil
+        self.session = nil
+        task = nil
+        lock.unlock()
+
+        session?.finishTasksAndInvalidate()
+        continuation?.resume(with: result)
+    }
+}
+
+/// Rate-limits byte progress callbacks so a multi-gigabyte download does not
+/// spawn thousands of main-actor UI updates.
 private final class DownloadProgressThrottle: @unchecked Sendable {
     private let lock = NSLock()
     private var lastReported: Double = -1

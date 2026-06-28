@@ -8,19 +8,9 @@ enum STTModelFamily {
     case nemotron
     case parakeet
 
-    /// Glob patterns passed to the HuggingFace snapshot download.
+    /// Hugging Face repository file patterns needed for local model loading.
     var downloadFilePatterns: [String] {
-        switch self {
-        case .qwen3:
-            return ["*.safetensors", "*.json", "merges.txt"]
-        case .nemotron:
-            // The vocabulary and prompt tables are embedded in config.json;
-            // there is no separate tokenizer artifact to fetch.
-            return ["*.safetensors", "*.json"]
-        case .parakeet:
-            // Parakeet stores vocabulary/decoder metadata in config.json.
-            return ["*.safetensors", "*.json"]
-        }
+        ["*.safetensors", "*.json", "*.txt", "*.wav"]
     }
 
     /// Files, beyond weights and config.json, that must exist locally for a

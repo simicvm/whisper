@@ -50,6 +50,7 @@ final class AppState {
     var isEditingHotkey = false
     var modelStatus: ModelStatus = .notLoaded
     var downloadedModelRepoIDs: Set<String> = []
+    var removableModelRepoIDs: Set<String> = []
     var microphonePermission: PermissionStatus = .unknown
     var accessibilityPermission: PermissionStatus = .unknown
     var runOnStartupEnabled = false

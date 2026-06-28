@@ -371,6 +371,7 @@ struct WhisperApp: App {
     private func refreshDownloadedModels() async {
         let repoIDs = STTModelDefinition.allModels.map(\.repoID)
         appState.downloadedModelRepoIDs = await transcriptionService.downloadedModelRepoIDs(for: repoIDs)
+        appState.removableModelRepoIDs = await transcriptionService.removableModelRepoIDs(for: repoIDs)
     }
 
     @MainActor
@@ -384,6 +385,7 @@ struct WhisperApp: App {
         do {
             try await transcriptionService.deleteLocalModel(repoID: repoID)
             appState.downloadedModelRepoIDs.remove(repoID)
+            appState.removableModelRepoIDs.remove(repoID)
 
             if appState.selectedModelID == repoID {
                 appState.modelStatus = .notLoaded
@@ -429,10 +431,12 @@ struct WhisperApp: App {
 
                     appState.modelStatus = .loaded
                     appState.downloadedModelRepoIDs.insert(repoID)
+                    appState.removableModelRepoIDs.insert(repoID)
                     _ = appState.transition(to: .idle)
                     modelLoadTask = nil
                 }
             } catch is CancellationError {
+                await refreshDownloadedModels()
                 await MainActor.run {
                     guard generation == modelLoadGeneration else { return }
                     modelLoadTask = nil
@@ -450,6 +454,7 @@ struct WhisperApp: App {
                     }
                 }
             } catch {
+                await refreshDownloadedModels()
                 await MainActor.run {
                     guard generation == modelLoadGeneration else { return }
                     guard appState.selectedModelID == repoID else { return }
