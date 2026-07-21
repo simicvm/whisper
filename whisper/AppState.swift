@@ -5,6 +5,7 @@ import Observation
 enum AppPhase: Equatable {
     case idle
     case loading(String) // loading model, message
+    case starting
     case recording
     case transcribing
     case pasting
@@ -14,6 +15,7 @@ enum AppPhase: Equatable {
 private enum AppPhaseKind: Equatable {
     case idle
     case loading
+    case starting
     case recording
     case transcribing
     case pasting
@@ -27,6 +29,8 @@ private extension AppPhase {
             return .idle
         case .loading:
             return .loading
+        case .starting:
+            return .starting
         case .recording:
             return .recording
         case .transcribing:
@@ -63,6 +67,8 @@ final class AppState {
         switch phase {
         case .loading(let msg):
             return msg
+        case .starting:
+            return "Starting microphone..."
         case .recording:
             return "Recording..."
         case .transcribing:
@@ -92,6 +98,8 @@ final class AppState {
 
     var menuStatusLabel: String {
         switch phase {
+        case .starting:
+            return "Whisper Starting"
         case .recording:
             return "Whisper Recording"
         case .transcribing:
@@ -142,7 +150,7 @@ final class AppState {
             default:
                 return .orange
             }
-        case .loading:
+        case .loading, .starting:
             return .orange
         }
     }
@@ -158,6 +166,8 @@ final class AppState {
     var menuBarIcon: String {
         switch phase {
         case .idle:
+            return "waveform.circle"
+        case .starting:
             return "waveform.circle"
         case .loading:
             switch modelStatus {
@@ -223,9 +233,11 @@ final class AppState {
 
         switch current {
         case .idle:
-            return next == .loading || next == .recording
+            return next == .loading || next == .starting
         case .loading:
             return next == .idle || next == .loading
+        case .starting:
+            return next == .recording || next == .idle
         case .recording:
             return next == .transcribing || next == .idle
         case .transcribing:

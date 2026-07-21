@@ -1,21 +1,37 @@
 import Accelerate
 import AVFoundation
+import CoreAudio
 import Foundation
 
 /// Records microphone audio and returns raw float32 samples at 16kHz.
 final class AudioRecorder: @unchecked Sendable {
     static let defaultMaximumDuration: TimeInterval = 90
 
+    private struct InputFingerprint: Equatable {
+        let deviceID: AudioDeviceID
+        let nominalSampleRate: Double
+        let channelCount: UInt32
+    }
+
     /// Reused across recordings: rebuilding the engine (and the input audio
     /// unit behind `inputNode`) on every key-down adds avoidable latency
     /// before capture starts. `stop()` halts the engine — releasing the
     /// microphone and its privacy indicator — but keeps the graph alive.
     private var engine = AVAudioEngine()
+    private var engineInputFingerprint: InputFingerprint?
+    private var configurationObserver: NSObjectProtocol?
+    private let configurationLock = NSLock()
+    private var configurationIsDirty = false
+    private var configurationGeneration: UInt64 = 0
+    private var configurationRevision: UInt64 = 0
+    private var tapInstalled = false
     private var nativeSamples: [Float] = []
     private var nativeSampleRate: Double = 0
     private let lock = NSLock()
     private var isRecording = false
     private var onLevel: (@Sendable (Float) -> Void)?
+    private var onInputConfigurationChange: (@MainActor @Sendable () -> Void)?
+    private var didReportInputConfigurationChange = false
 
     /// Target sample rate for the STT model.
     private let targetSampleRate: Double = 16000
@@ -23,17 +39,37 @@ final class AudioRecorder: @unchecked Sendable {
 
     init(maximumDuration: TimeInterval = AudioRecorder.defaultMaximumDuration) {
         self.maximumDuration = max(1, maximumDuration)
+        observeConfigurationChanges()
+    }
+
+    deinit {
+        invalidateConfigurationObserver()
     }
 
     /// Start recording from the default microphone.
     /// - Parameter onLevel: Called on every buffer with the current RMS level (0–1).
-    func start(onLevel: (@Sendable (Float) -> Void)? = nil) throws {
-        self.onLevel = onLevel
+    /// - Parameter onInputConfigurationChange: Called if the audio route changes while recording.
+    func start(
+        onLevel: (@Sendable (Float) -> Void)? = nil,
+        onInputConfigurationChange: (@MainActor @Sendable () -> Void)? = nil
+    ) throws {
+        lock.lock()
+        let recordingAlreadyActive = isRecording
+        lock.unlock()
+
+        guard !recordingAlreadyActive, !tapInstalled else {
+            throw AudioRecorderError.alreadyRecording
+        }
+
+        let currentInput = try Self.currentInputFingerprint()
+        if shouldReplaceEngine(for: currentInput) {
+            replaceEngine()
+        }
 
         let inputNode = engine.inputNode
         let nativeFormat = inputNode.outputFormat(forBus: 0)
 
-        guard nativeFormat.sampleRate > 0 else {
+        guard nativeFormat.sampleRate > 0, nativeFormat.channelCount > 0 else {
             throw AudioRecorderError.noMicrophone
         }
 
@@ -47,6 +83,9 @@ final class AudioRecorder: @unchecked Sendable {
         // grow geometrically beyond this.
         nativeSamples.reserveCapacity(Int(nativeFormat.sampleRate * min(30, maximumDuration)))
         isRecording = true
+        self.onLevel = onLevel
+        self.onInputConfigurationChange = onInputConfigurationChange
+        didReportInputConfigurationChange = false
         lock.unlock()
 
         // Capture callback and sample rate as locals so the tap closure
@@ -93,16 +132,45 @@ final class AudioRecorder: @unchecked Sendable {
             }
             self.lock.unlock()
         }
+        tapInstalled = true
 
         do {
             try engine.start()
+            engineInputFingerprint = currentInput
         } catch {
-            // A stale configuration (e.g. the default input device changed
-            // while idle) can fail to start. Discard the engine — and the tap
-            // installed above with it — so the next attempt starts clean.
-            engine = AVAudioEngine()
+            cleanUpFailedStart()
             throw error
         }
+    }
+
+    /// Returns whether the engine is still running on the input used at start.
+    /// A harmless configuration notification is cleared so later changes can
+    /// still notify the app.
+    func activeInputConfigurationIsValid() -> Bool {
+        configurationLock.lock()
+        let revision = configurationRevision
+        configurationLock.unlock()
+
+        guard engine.isRunning,
+              let engineInputFingerprint,
+              let currentInput = try? Self.currentInputFingerprint(),
+              currentInput == engineInputFingerprint else {
+            return false
+        }
+
+        configurationLock.lock()
+        let noNewerChange = configurationRevision == revision
+        if noNewerChange {
+            configurationIsDirty = false
+        }
+        configurationLock.unlock()
+
+        guard noNewerChange else { return false }
+
+        lock.lock()
+        didReportInputConfigurationChange = false
+        lock.unlock()
+        return true
     }
 
     /// Stop recording and return the captured audio samples resampled to 16kHz mono float32.
@@ -112,11 +180,16 @@ final class AudioRecorder: @unchecked Sendable {
         let captured = nativeSamples
         let capturedRate = nativeSampleRate
         nativeSamples.removeAll()
+        onLevel = nil
+        onInputConfigurationChange = nil
+        didReportInputConfigurationChange = false
         lock.unlock()
 
-        engine.inputNode.removeTap(onBus: 0)
+        if tapInstalled {
+            engine.inputNode.removeTap(onBus: 0)
+            tapInstalled = false
+        }
         engine.stop()
-        onLevel = nil
 
         guard !captured.isEmpty else { return [] }
 
@@ -126,6 +199,200 @@ final class AudioRecorder: @unchecked Sendable {
         }
 
         return resample(captured, from: capturedRate, to: targetSampleRate)
+    }
+
+    private func shouldReplaceEngine(for currentInput: InputFingerprint) -> Bool {
+        configurationLock.lock()
+        let isDirty = configurationIsDirty
+        configurationLock.unlock()
+
+        if isDirty {
+            return true
+        }
+
+        guard let engineInputFingerprint else {
+            return false
+        }
+        return engineInputFingerprint != currentInput
+    }
+
+    /// Replace the engine outside its configuration-change callback. Apple
+    /// warns that releasing an engine from that callback can deadlock.
+    private func replaceEngine() {
+        invalidateConfigurationObserver()
+        engine.stop()
+        engine = AVAudioEngine()
+        engineInputFingerprint = nil
+        tapInstalled = false
+        observeConfigurationChanges()
+    }
+
+    private func cleanUpFailedStart() {
+        lock.lock()
+        isRecording = false
+        nativeSamples.removeAll()
+        onLevel = nil
+        onInputConfigurationChange = nil
+        didReportInputConfigurationChange = false
+        lock.unlock()
+
+        if tapInstalled {
+            engine.inputNode.removeTap(onBus: 0)
+            tapInstalled = false
+        }
+        replaceEngine()
+    }
+
+    private func observeConfigurationChanges() {
+        configurationLock.lock()
+        configurationGeneration &+= 1
+        let generation = configurationGeneration
+        configurationIsDirty = false
+        configurationLock.unlock()
+
+        configurationObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: engine,
+            queue: nil
+        ) { [weak self] _ in
+            self?.markInputConfigurationDirty(generation: generation)
+        }
+    }
+
+    private func invalidateConfigurationObserver() {
+        configurationLock.lock()
+        configurationGeneration &+= 1
+        configurationIsDirty = false
+        configurationLock.unlock()
+
+        if let configurationObserver {
+            NotificationCenter.default.removeObserver(configurationObserver)
+            self.configurationObserver = nil
+        }
+    }
+
+    /// This may run on AVAudioEngine's internal thread. It only marks state
+    /// and wakes the app; engine teardown happens later on the main actor.
+    private func markInputConfigurationDirty(generation: UInt64) {
+        configurationLock.lock()
+        guard generation == configurationGeneration else {
+            configurationLock.unlock()
+            return
+        }
+        configurationIsDirty = true
+        configurationRevision &+= 1
+        configurationLock.unlock()
+
+        lock.lock()
+        let callback: (@MainActor @Sendable () -> Void)?
+        if isRecording, !didReportInputConfigurationChange {
+            didReportInputConfigurationChange = true
+            callback = onInputConfigurationChange
+        } else {
+            callback = nil
+        }
+        lock.unlock()
+
+        if let callback {
+            Task { @MainActor in
+                callback()
+            }
+        }
+    }
+
+    private static func currentInputFingerprint() throws -> InputFingerprint {
+        var defaultInputAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var deviceID = AudioDeviceID(kAudioObjectUnknown)
+        var deviceIDSize = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let defaultInputStatus = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &defaultInputAddress,
+            0,
+            nil,
+            &deviceIDSize,
+            &deviceID
+        )
+        guard defaultInputStatus == noErr, deviceID != kAudioObjectUnknown else {
+            throw AudioRecorderError.audioHardware(defaultInputStatus)
+        }
+
+        var sampleRateAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var nominalSampleRate: Float64 = 0
+        var sampleRateSize = UInt32(MemoryLayout<Float64>.size)
+        let sampleRateStatus = AudioObjectGetPropertyData(
+            deviceID,
+            &sampleRateAddress,
+            0,
+            nil,
+            &sampleRateSize,
+            &nominalSampleRate
+        )
+        guard sampleRateStatus == noErr else {
+            throw AudioRecorderError.audioHardware(sampleRateStatus)
+        }
+        guard nominalSampleRate > 0 else {
+            throw AudioRecorderError.noMicrophone
+        }
+
+        var streamAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamConfiguration,
+            mScope: kAudioObjectPropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var streamConfigurationSize: UInt32 = 0
+        let streamSizeStatus = AudioObjectGetPropertyDataSize(
+            deviceID,
+            &streamAddress,
+            0,
+            nil,
+            &streamConfigurationSize
+        )
+        guard streamSizeStatus == noErr else {
+            throw AudioRecorderError.audioHardware(streamSizeStatus)
+        }
+        guard streamConfigurationSize >= MemoryLayout<AudioBufferList>.size else {
+            throw AudioRecorderError.noMicrophone
+        }
+
+        let rawBufferList = UnsafeMutableRawPointer.allocate(
+            byteCount: Int(streamConfigurationSize),
+            alignment: MemoryLayout<AudioBufferList>.alignment
+        )
+        defer { rawBufferList.deallocate() }
+
+        let streamStatus = AudioObjectGetPropertyData(
+            deviceID,
+            &streamAddress,
+            0,
+            nil,
+            &streamConfigurationSize,
+            rawBufferList
+        )
+        guard streamStatus == noErr else {
+            throw AudioRecorderError.audioHardware(streamStatus)
+        }
+
+        let audioBufferList = rawBufferList.assumingMemoryBound(to: AudioBufferList.self)
+        let channelCount = UnsafeMutableAudioBufferListPointer(audioBufferList).reduce(UInt32(0)) {
+            $0 + $1.mNumberChannels
+        }
+        guard channelCount > 0 else {
+            throw AudioRecorderError.noMicrophone
+        }
+
+        return InputFingerprint(
+            deviceID: deviceID,
+            nominalSampleRate: nominalSampleRate,
+            channelCount: channelCount
+        )
     }
 
     /// Resample audio offline using AVAudioConverter (not in a real-time callback).
@@ -202,11 +469,17 @@ final class AudioRecorder: @unchecked Sendable {
 
 enum AudioRecorderError: LocalizedError {
     case noMicrophone
+    case alreadyRecording
+    case audioHardware(OSStatus)
 
     var errorDescription: String? {
         switch self {
         case .noMicrophone:
             return "No microphone available"
+        case .alreadyRecording:
+            return "A recording is already in progress"
+        case .audioHardware(let status):
+            return "Audio input is unavailable (Core Audio error \(status))"
         }
     }
 }

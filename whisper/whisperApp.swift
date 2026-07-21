@@ -232,18 +232,26 @@ struct WhisperApp: App {
             return
         }
 
-        _ = appState.transition(to: .recording)
-        overlayManager.show(appState: appState)
-        startRecordingTimeout()
+        _ = appState.transition(to: .starting)
 
         do {
-            try audioRecorder.start { [appState] (level: Float) in
-                Task { @MainActor in
-                    appState.audioLevel = level
+            try audioRecorder.start(
+                onLevel: { [appState] (level: Float) in
+                    Task { @MainActor in
+                        appState.audioLevel = level
+                    }
+                },
+                onInputConfigurationChange: {
+                    handleInputConfigurationChange()
                 }
-            }
+            )
+
+            _ = appState.transition(to: .recording)
+            overlayManager.show(appState: appState)
+            startRecordingTimeout()
         } catch {
             cancelRecordingTimeout()
+            appState.audioLevel = 0
             _ = appState.transition(to: .error(error.localizedDescription))
             overlayManager.hide()
             resetAfterDelay()
@@ -275,6 +283,19 @@ struct WhisperApp: App {
     private func cancelRecordingTimeout() {
         recordingTimeoutTask?.cancel()
         recordingTimeoutTask = nil
+    }
+
+    @MainActor
+    private func handleInputConfigurationChange() {
+        guard appState.phase == .starting || appState.phase == .recording else { return }
+        guard !audioRecorder.activeInputConfigurationIsValid() else { return }
+
+        cancelRecordingTimeout()
+        _ = audioRecorder.stop()
+        appState.audioLevel = 0
+        overlayManager.hide()
+        _ = appState.transition(to: .error("Audio input changed. Try again."))
+        resetAfterDelay(seconds: 2)
     }
 
     @MainActor
@@ -349,7 +370,7 @@ struct WhisperApp: App {
     @MainActor
     private func selectModel(_ model: STTModelDefinition) {
         switch appState.phase {
-        case .recording, .transcribing, .pasting:
+        case .starting, .recording, .transcribing, .pasting:
             return
         default:
             break

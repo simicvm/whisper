@@ -346,7 +346,7 @@ struct MenuBarView: View {
 
     private var isModelInteractionDisabled: Bool {
         switch appState.phase {
-        case .recording, .transcribing, .pasting:
+        case .starting, .recording, .transcribing, .pasting:
             return true
         default:
             return false
