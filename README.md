@@ -125,7 +125,7 @@ Hotkey/
 
 | Package | Requirement | Products used | Purpose |
 |---------|-------------|---------------|---------|
-| [mlx-audio-swift](https://github.com/Blaizzy/mlx-audio-swift) | `revision: 416f08c063b5353c6600e57b1344c287a70a910d` | `MLXAudioSTT`, `MLXAudioCore` | On-device speech-to-text and audio ML pipeline |
+| [mlx-audio-swift](https://github.com/Neywa-Labs/mlx-audio-swift) | `exact: 0.1.9` | `MLXAudioSTT`, `MLXAudioCore` | On-device speech-to-text and audio ML pipeline |
 
 ## License
 

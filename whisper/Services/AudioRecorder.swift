@@ -27,6 +27,15 @@ final class AudioRecorder: @unchecked Sendable {
     private var tapInstalled = false
     private var nativeSamples: [Float] = []
     private var nativeSampleRate: Double = 0
+    /// Audio from earlier segments of the current recording, already at the
+    /// target rate. A recording gains a segment each time the engine is
+    /// restarted after the input device reconfigures itself mid-recording.
+    private var completedSamples: [Float] = []
+    /// Identifies the live tap so a late buffer from a replaced engine can't
+    /// be appended to a segment recorded at a different sample rate.
+    private var segmentID: UInt64 = 0
+    /// Device the current recording started on (main thread only).
+    private var recordingDeviceID: AudioDeviceID?
     private let lock = NSLock()
     private var isRecording = false
     private var onLevel: (@Sendable (Float) -> Void)?
@@ -66,6 +75,81 @@ final class AudioRecorder: @unchecked Sendable {
             replaceEngine()
         }
 
+        lock.lock()
+        completedSamples.removeAll()
+        nativeSamples.removeAll()
+        isRecording = true
+        self.onLevel = onLevel
+        self.onInputConfigurationChange = onInputConfigurationChange
+        lock.unlock()
+
+        do {
+            try installTapAndStartEngine(input: currentInput)
+            recordingDeviceID = currentInput.deviceID
+        } catch {
+            cleanUpFailedStart()
+            throw error
+        }
+    }
+
+    /// Outcome of trying to continue a recording after the engine stopped
+    /// itself for an input configuration change.
+    enum ConfigurationRecovery {
+        /// The engine is capturing again on the same device.
+        case recovered
+        /// The device isn't ready yet (still switching modes); try again shortly.
+        case retry
+        /// The recording can't continue: it ended, or the input device changed.
+        case failed
+    }
+
+    /// Continue the current recording after a configuration change on the
+    /// same input device. Bluetooth headsets (AirPods) switch into headset
+    /// mode when their microphone opens, which changes the device's sample
+    /// rate and makes the engine stop itself moments after it started.
+    ///
+    /// Audio captured so far is kept; capture resumes at the device's new
+    /// format. Call on the main thread, outside the configuration-change
+    /// callback.
+    func recoverFromConfigurationChange() -> ConfigurationRecovery {
+        lock.lock()
+        let recording = isRecording
+        lock.unlock()
+
+        guard recording, let recordingDeviceID else { return .failed }
+        guard let currentInput = try? Self.currentInputFingerprint() else { return .retry }
+        guard currentInput.deviceID == recordingDeviceID else { return .failed }
+
+        // Seal the segment captured at the old sample rate.
+        lock.lock()
+        let segment = nativeSamples
+        let segmentRate = nativeSampleRate
+        nativeSamples.removeAll()
+        lock.unlock()
+
+        let converted = convertToTargetRate(segment, from: segmentRate)
+        if !converted.isEmpty {
+            lock.lock()
+            completedSamples.append(contentsOf: converted)
+            lock.unlock()
+        }
+
+        removeTapIfInstalled()
+        replaceEngine()
+
+        do {
+            try installTapAndStartEngine(input: currentInput)
+            return .recovered
+        } catch {
+            removeTapIfInstalled()
+            replaceEngine()
+            return .retry
+        }
+    }
+
+    /// Installs the capture tap for a new segment of the current recording
+    /// and starts the engine. Recording state must already be set up.
+    private func installTapAndStartEngine(input: InputFingerprint) throws {
         let inputNode = engine.inputNode
         let nativeFormat = inputNode.outputFormat(forBus: 0)
 
@@ -73,27 +157,27 @@ final class AudioRecorder: @unchecked Sendable {
             throw AudioRecorderError.noMicrophone
         }
 
-        nativeSampleRate = nativeFormat.sampleRate
-
         lock.lock()
-        nativeSamples.removeAll()
+        segmentID &+= 1
+        let segment = segmentID
+        nativeSampleRate = nativeFormat.sampleRate
+        let remainingDuration = max(
+            0,
+            maximumDuration - Double(completedSamples.count) / targetSampleRate
+        )
         // Reserve enough for a typical dictation up front so the audio-thread
         // tap doesn't repeatedly reallocate-and-copy while appending (a 90s
         // recording at 48kHz grows to ~4.3M floats). Longer recordings still
         // grow geometrically beyond this.
-        nativeSamples.reserveCapacity(Int(nativeFormat.sampleRate * min(30, maximumDuration)))
-        isRecording = true
-        self.onLevel = onLevel
-        self.onInputConfigurationChange = onInputConfigurationChange
+        nativeSamples.reserveCapacity(Int(nativeFormat.sampleRate * min(30, remainingDuration)))
+        // Capture the callback and limit as locals so the tap closure doesn't
+        // read instance properties from the audio thread without
+        // synchronisation. Both are immutable for the lifetime of this segment.
+        let capturedOnLevel = onLevel
         didReportInputConfigurationChange = false
         lock.unlock()
 
-        // Capture callback and sample rate as locals so the tap closure
-        // doesn't read instance properties from the audio thread without
-        // synchronisation. Both values are immutable for the lifetime of
-        // this recording session.
-        let capturedOnLevel = onLevel
-        let capturedRate = nativeSampleRate
+        let segmentSampleLimit = Int(nativeFormat.sampleRate * remainingDuration)
 
         // Tap in the native format — no conversion during recording
         inputNode.installTap(onBus: 0, bufferSize: 4096, format: nativeFormat) { [weak self] buffer, _ in
@@ -115,9 +199,8 @@ final class AudioRecorder: @unchecked Sendable {
             }
 
             self.lock.lock()
-            if self.isRecording {
-                let maxNativeSamples = Int(capturedRate * self.maximumDuration)
-                let remaining = maxNativeSamples - self.nativeSamples.count
+            if self.isRecording, self.segmentID == segment {
+                let remaining = segmentSampleLimit - self.nativeSamples.count
 
                 if remaining > 0 {
                     if count <= remaining {
@@ -134,13 +217,23 @@ final class AudioRecorder: @unchecked Sendable {
         }
         tapInstalled = true
 
-        do {
-            try engine.start()
-            engineInputFingerprint = currentInput
-        } catch {
-            cleanUpFailedStart()
-            throw error
+        try engine.start()
+        engineInputFingerprint = input
+    }
+
+    private func removeTapIfInstalled() {
+        if tapInstalled {
+            engine.inputNode.removeTap(onBus: 0)
+            tapInstalled = false
         }
+    }
+
+    private func convertToTargetRate(_ samples: [Float], from rate: Double) -> [Float] {
+        guard !samples.isEmpty, rate > 0 else { return [] }
+        if rate == targetSampleRate {
+            return samples
+        }
+        return resample(samples, from: rate, to: targetSampleRate)
     }
 
     /// Returns whether the engine is still running on the input used at start.
@@ -177,28 +270,22 @@ final class AudioRecorder: @unchecked Sendable {
     func stop() -> [Float] {
         lock.lock()
         isRecording = false
+        let earlier = completedSamples
         let captured = nativeSamples
         let capturedRate = nativeSampleRate
+        completedSamples.removeAll()
         nativeSamples.removeAll()
         onLevel = nil
         onInputConfigurationChange = nil
         didReportInputConfigurationChange = false
         lock.unlock()
 
-        if tapInstalled {
-            engine.inputNode.removeTap(onBus: 0)
-            tapInstalled = false
-        }
+        recordingDeviceID = nil
+        removeTapIfInstalled()
         engine.stop()
 
-        guard !captured.isEmpty else { return [] }
-
-        // Resample to 16kHz if needed
-        if capturedRate == targetSampleRate {
-            return captured
-        }
-
-        return resample(captured, from: capturedRate, to: targetSampleRate)
+        // Earlier segments are already at 16kHz; convert the live one.
+        return earlier + convertToTargetRate(captured, from: capturedRate)
     }
 
     private func shouldReplaceEngine(for currentInput: InputFingerprint) -> Bool {
@@ -230,16 +317,15 @@ final class AudioRecorder: @unchecked Sendable {
     private func cleanUpFailedStart() {
         lock.lock()
         isRecording = false
+        completedSamples.removeAll()
         nativeSamples.removeAll()
         onLevel = nil
         onInputConfigurationChange = nil
         didReportInputConfigurationChange = false
         lock.unlock()
 
-        if tapInstalled {
-            engine.inputNode.removeTap(onBus: 0)
-            tapInstalled = false
-        }
+        recordingDeviceID = nil
+        removeTapIfInstalled()
         replaceEngine()
     }
 

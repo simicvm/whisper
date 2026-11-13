@@ -597,10 +597,10 @@
 /* Begin XCRemoteSwiftPackageReference section */
 		AA000001AAAA000000000001 /* XCRemoteSwiftPackageReference "mlx-audio-swift" */ = {
 			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/Blaizzy/mlx-audio-swift.git";
+			repositoryURL = "https://github.com/Neywa-Labs/mlx-audio-swift.git";
 			requirement = {
-				kind = revision;
-				revision = 416f08c063b5353c6600e57b1344c287a70a910d;
+				kind = exactVersion;
+				version = 0.1.9;
 			};
 		};
 /* End XCRemoteSwiftPackageReference section */

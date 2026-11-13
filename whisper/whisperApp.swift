@@ -26,6 +26,7 @@ struct WhisperApp: App {
     @State private var hotkeyConfigured = false
     @State private var accessibilityPollTask: Task<Void, Never>?
     @State private var errorResetTask: Task<Void, Never>?
+    @State private var inputRecoveryTask: Task<Void, Never>?
 
     private static let maxRecordingDurationSeconds = AudioRecorder.defaultMaximumDuration
     private static let minimumSpeechDurationSeconds = 0.2
@@ -289,7 +290,40 @@ struct WhisperApp: App {
     private func handleInputConfigurationChange() {
         guard appState.phase == .starting || appState.phase == .recording else { return }
         guard !audioRecorder.activeInputConfigurationIsValid() else { return }
+        guard inputRecoveryTask == nil else { return }
 
+        // The engine stopped itself. If the input device is still the same
+        // one (AirPods switching into headset mode when the mic opens), keep
+        // the recording going on the device's new format. The device can take
+        // a moment to settle, so retry briefly before giving up.
+        inputRecoveryTask = Task { @MainActor in
+            defer { inputRecoveryTask = nil }
+
+            for _ in 0..<20 {
+                guard appState.phase == .starting || appState.phase == .recording else { return }
+
+                switch audioRecorder.recoverFromConfigurationChange() {
+                case .recovered:
+                    return
+                case .failed:
+                    abortRecordingAfterInputChange()
+                    return
+                case .retry:
+                    do {
+                        try await Task.sleep(for: .milliseconds(100))
+                    } catch {
+                        return
+                    }
+                }
+            }
+
+            guard appState.phase == .starting || appState.phase == .recording else { return }
+            abortRecordingAfterInputChange()
+        }
+    }
+
+    @MainActor
+    private func abortRecordingAfterInputChange() {
         cancelRecordingTimeout()
         _ = audioRecorder.stop()
         appState.audioLevel = 0
