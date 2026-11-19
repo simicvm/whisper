@@ -211,4 +211,34 @@ struct whisperTests {
         #expect(appState.phase == .starting)
     }
 
+    @Test
+    func snapshotValidationRejectsIncompleteShardsAndMissingTokenizerFiles() throws {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent("whisper-snapshot-test-\(UUID().uuidString)")
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: dir) }
+
+        try Data("{}".utf8).write(to: dir.appendingPathComponent("config.json"))
+        // Empty 0-byte weights file should fail.
+        try Data().write(to: dir.appendingPathComponent("model-00001-of-00002.safetensors"))
+        #expect(!TranscriptionService.hasCompleteModelSnapshotSync(at: dir, family: .parakeet))
+
+        // Non-empty shard 1, but index references missing shard 2 -> should fail.
+        try Data("weights".utf8).write(to: dir.appendingPathComponent("model-00001-of-00002.safetensors"))
+        let indexJSON = #"{"weight_map":{"a":"model-00001-of-00002.safetensors","b":"model-00002-of-00002.safetensors"}}"#
+        try Data(indexJSON.utf8).write(to: dir.appendingPathComponent("model.safetensors.index.json"))
+        #expect(!TranscriptionService.hasCompleteModelSnapshotSync(at: dir, family: .parakeet))
+
+        // Add shard 2 -> Parakeet is now complete, but Qwen3 still misses vocab.json/merges.txt/tokenizer_config.json.
+        try Data("weights2".utf8).write(to: dir.appendingPathComponent("model-00002-of-00002.safetensors"))
+        #expect(TranscriptionService.hasCompleteModelSnapshotSync(at: dir, family: .parakeet))
+        #expect(!TranscriptionService.hasCompleteModelSnapshotSync(at: dir, family: .qwen3))
+
+        // Add Qwen3 auxiliary files -> Qwen3 is complete.
+        try Data("{}".utf8).write(to: dir.appendingPathComponent("vocab.json"))
+        try Data("a b\n".utf8).write(to: dir.appendingPathComponent("merges.txt"))
+        try Data("{}".utf8).write(to: dir.appendingPathComponent("tokenizer_config.json"))
+        #expect(TranscriptionService.hasCompleteModelSnapshotSync(at: dir, family: .qwen3))
+    }
+
 }

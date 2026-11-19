@@ -18,7 +18,7 @@ enum STTModelFamily {
     var requiredAuxiliaryFiles: [String] {
         switch self {
         case .qwen3:
-            return ["merges.txt"]
+            return ["vocab.json", "merges.txt", "tokenizer_config.json"]
         case .nemotron:
             return []
         case .parakeet:

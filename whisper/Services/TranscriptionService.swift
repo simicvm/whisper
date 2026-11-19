@@ -266,6 +266,11 @@ actor TranscriptionService {
             throw TranscriptionError.noDownloadableModelFiles(definition.repoID)
         }
 
+        // Remove any previous snapshot manifest before modifying files so an
+        // interrupted download cannot be mistaken for a complete snapshot.
+        let manifestURL = snapshotManifestURL(in: modelDir)
+        try? FileManager.default.removeItem(at: manifestURL)
+
         let totalBytes = max(files.reduce(Int64(0)) { $0 + $1.weight }, 1)
         let progressThrottle = DownloadProgressThrottle()
         var completedBytes = files.reduce(Int64(0)) { partial, file in
@@ -311,6 +316,19 @@ actor TranscriptionService {
                 updateHandler: updateHandler
             )
         }
+
+        // Record the full set of expected files and sizes atomically once all
+        // downloads have succeeded so future launches can verify completeness.
+        let manifest = LocalSnapshotManifest(
+            files: files.map { file in
+                LocalSnapshotManifest.FileEntry(
+                    path: file.entry.path,
+                    size: file.expectedSize ?? localFileSize(at: file.destination)
+                )
+            }
+        )
+        let manifestData = try JSONEncoder().encode(manifest)
+        try manifestData.write(to: manifestURL, options: .atomic)
     }
 
     private static func matchesDownloadPatterns(path: String, patterns: [String]) -> Bool {
@@ -372,6 +390,12 @@ actor TranscriptionService {
         }
     }
 
+    private static let snapshotManifestFilename = ".whisper-snapshot.json"
+
+    private static func snapshotManifestURL(in modelDir: URL) -> URL {
+        modelDir.appendingPathComponent(snapshotManifestFilename)
+    }
+
     private static func hasCompleteModelSnapshot(at modelDir: URL, family: STTModelFamily) async -> Bool {
         await withCheckedContinuation { continuation in
             cacheInspectionQueue.async {
@@ -380,25 +404,74 @@ actor TranscriptionService {
         }
     }
 
-    private static func hasCompleteModelSnapshotSync(at modelDir: URL, family: STTModelFamily) -> Bool {
-        guard FileManager.default.fileExists(atPath: modelDir.path) else {
+    internal static func hasCompleteModelSnapshotSync(at modelDir: URL, family: STTModelFamily) -> Bool {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: modelDir.path) else {
             return false
         }
 
-        let files = (try? FileManager.default.contentsOfDirectory(
+        // If a manifest exists, verify every listed file is present with its expected size.
+        let manifestURL = snapshotManifestURL(in: modelDir)
+        if fm.fileExists(atPath: manifestURL.path) {
+            guard let data = try? Data(contentsOf: manifestURL),
+                  let manifest = try? JSONDecoder().decode(LocalSnapshotManifest.self, from: data),
+                  !manifest.files.isEmpty else {
+                return false
+            }
+            for entry in manifest.files {
+                guard let fileURL = try? modelFileDestination(for: entry.path, in: modelDir),
+                      let actualSize = localFileSize(at: fileURL) else {
+                    return false
+                }
+                if let expectedSize = entry.size {
+                    guard actualSize == expectedSize else { return false }
+                } else {
+                    guard actualSize > 0 else { return false }
+                }
+            }
+        }
+
+        let files = (try? fm.contentsOfDirectory(
             at: modelDir,
-            includingPropertiesForKeys: nil
+            includingPropertiesForKeys: [.fileSizeKey]
         )) ?? []
 
-        let hasWeights = files.contains { $0.pathExtension == "safetensors" }
-        let hasAuxiliaryFiles = family.requiredAuxiliaryFiles.allSatisfy { fileName in
-            FileManager.default.fileExists(
-                atPath: modelDir.appendingPathComponent(fileName).path
-            )
+        let hasWeights = files.contains { file in
+            guard file.pathExtension == "safetensors" else { return false }
+            let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+            return size > 0
         }
+        guard hasWeights else { return false }
+
+        // For sharded checkpoints, verify every shard referenced by the index exists and is non-empty.
+        let indexURL = modelDir.appendingPathComponent("model.safetensors.index.json")
+        if fm.fileExists(atPath: indexURL.path) {
+            guard let indexData = try? Data(contentsOf: indexURL),
+                  let indexJSON = try? JSONSerialization.jsonObject(with: indexData) as? [String: Any],
+                  let weightMap = indexJSON["weight_map"] as? [String: String] else {
+                return false
+            }
+            let requiredShards = Set(weightMap.values)
+            guard !requiredShards.isEmpty else { return false }
+            for shardName in requiredShards {
+                guard let shardURL = try? modelFileDestination(for: shardName, in: modelDir),
+                      let shardSize = localFileSize(at: shardURL),
+                      shardSize > 0 else {
+                    return false
+                }
+            }
+        }
+
+        let hasAuxiliaryFiles = family.requiredAuxiliaryFiles.allSatisfy { fileName in
+            let url = modelDir.appendingPathComponent(fileName)
+            guard let size = localFileSize(at: url), size > 0 else { return false }
+            return true
+        }
+        guard hasAuxiliaryFiles else { return false }
+
         let configPath = modelDir.appendingPathComponent("config.json")
         let hasValidConfig =
-            FileManager.default.fileExists(atPath: configPath.path)
+            fm.fileExists(atPath: configPath.path)
             && {
                 guard let data = try? Data(contentsOf: configPath) else {
                     return false
@@ -406,7 +479,7 @@ actor TranscriptionService {
                 return (try? JSONSerialization.jsonObject(with: data)) != nil
             }()
 
-        return hasWeights && hasAuxiliaryFiles && hasValidConfig
+        return hasValidConfig
     }
 
     /// Transcribe raw audio samples to text.
@@ -530,12 +603,21 @@ enum ModelLoadUpdate: Sendable {
     case initializing
 }
 
+private struct LocalSnapshotManifest: Codable, Sendable {
+    struct FileEntry: Codable, Sendable {
+        let path: String
+        let size: Int64?
+    }
+
+    let files: [FileEntry]
+}
+
 private struct ModelDownloadFile: Sendable {
     let entry: Git.TreeEntry
     let destination: URL
 
     var expectedSize: Int64? {
-        entry.size.map(Int64.init)
+        entry.effectiveSize.map(Int64.init)
     }
 
     var weight: Int64 {
@@ -580,10 +662,16 @@ private final class ModelFileDownloader: NSObject, URLSessionDownloadDelegate, @
     }
 
     private func start(request: URLRequest, continuation: CheckedContinuation<URL, Error>) {
+        lock.lock()
+        if cancelled {
+            finished = true
+            lock.unlock()
+            continuation.resume(throwing: CancellationError())
+            return
+        }
+
         let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
         let task = session.downloadTask(with: request)
-
-        lock.lock()
         self.session = session
         self.task = task
         self.continuation = continuation
@@ -627,12 +715,16 @@ private final class ModelFileDownloader: NSObject, URLSessionDownloadDelegate, @
         }
 
         do {
-            try FileManager.default.createDirectory(
+            let fm = FileManager.default
+            try fm.createDirectory(
                 at: destination.deletingLastPathComponent(),
                 withIntermediateDirectories: true
             )
-            try? FileManager.default.removeItem(at: destination)
-            try FileManager.default.moveItem(at: location, to: destination)
+            if fm.fileExists(atPath: destination.path) {
+                _ = try fm.replaceItemAt(destination, withItemAt: location)
+            } else {
+                try fm.moveItem(at: location, to: destination)
+            }
             finish(.success(destination))
         } catch {
             finish(.failure(error))
