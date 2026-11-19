@@ -46,6 +46,7 @@ final class AudioRecorder: @unchecked Sendable {
     private var isRecording = false
     private var reachedSampleLimit = false
     private var onLevel: (@Sendable (Float) -> Void)?
+    private var onAudioChunk: (@Sendable ([Float], Double) -> Void)?
     private var onInputConfigurationChange: (@MainActor @Sendable () -> Void)?
     private var didReportInputConfigurationChange = false
 
@@ -64,9 +65,11 @@ final class AudioRecorder: @unchecked Sendable {
 
     /// Start recording from the default microphone.
     /// - Parameter onLevel: Called on every buffer with the current RMS level (0–1).
+    /// - Parameter onAudioChunk: Optional callback receiving each captured mono Float32 chunk and its native sample rate.
     /// - Parameter onInputConfigurationChange: Called if the audio route changes while recording.
     func start(
         onLevel: (@Sendable (Float) -> Void)? = nil,
+        onAudioChunk: (@Sendable ([Float], Double) -> Void)? = nil,
         onInputConfigurationChange: (@MainActor @Sendable () -> Void)? = nil
     ) throws {
         lock.lock()
@@ -89,6 +92,7 @@ final class AudioRecorder: @unchecked Sendable {
         isRecording = true
         reachedSampleLimit = false
         self.onLevel = onLevel
+        self.onAudioChunk = onAudioChunk
         self.onInputConfigurationChange = onInputConfigurationChange
         lock.unlock()
 
@@ -184,6 +188,8 @@ final class AudioRecorder: @unchecked Sendable {
         // read instance properties from the audio thread without
         // synchronisation. Both are immutable for the lifetime of this segment.
         let capturedOnLevel = onLevel
+        let capturedOnAudioChunk = onAudioChunk
+        let capturedSampleRate = nativeFormat.sampleRate
         didReportInputConfigurationChange = false
         lock.unlock()
 
@@ -210,6 +216,7 @@ final class AudioRecorder: @unchecked Sendable {
                     onLevel(normalized)
                 }
 
+                var acceptedCount = 0
                 self.lock.lock()
                 if self.isRecording, !self.reachedSampleLimit, self.segmentID == segment {
                     let remaining = segmentSampleLimit - self.nativeSamples.count
@@ -217,15 +224,21 @@ final class AudioRecorder: @unchecked Sendable {
                     if remaining > 0 {
                         if count <= remaining {
                             self.nativeSamples.append(contentsOf: bufferPointer)
+                            acceptedCount = count
                         } else {
                             self.nativeSamples.append(contentsOf: bufferPointer.prefix(remaining))
                             self.reachedSampleLimit = true
+                            acceptedCount = remaining
                         }
                     } else {
                         self.reachedSampleLimit = true
                     }
                 }
                 self.lock.unlock()
+
+                if acceptedCount > 0, let onAudioChunk = capturedOnAudioChunk {
+                    onAudioChunk(Array(bufferPointer.prefix(acceptedCount)), capturedSampleRate)
+                }
             }
         }
         tapInstalled = true
@@ -300,6 +313,7 @@ final class AudioRecorder: @unchecked Sendable {
         completedDurationSeconds = 0
         nativeSamples.removeAll()
         onLevel = nil
+        onAudioChunk = nil
         onInputConfigurationChange = nil
         didReportInputConfigurationChange = false
         lock.unlock()
@@ -391,6 +405,7 @@ final class AudioRecorder: @unchecked Sendable {
         completedDurationSeconds = 0
         nativeSamples.removeAll()
         onLevel = nil
+        onAudioChunk = nil
         onInputConfigurationChange = nil
         didReportInputConfigurationChange = false
         lock.unlock()
@@ -806,6 +821,144 @@ final class AudioRecorder: @unchecked Sendable {
             throw AudioRecorderError.resamplingFailed
         }
         return output
+    }
+
+    /// Stateful streaming resampler that preserves `AVAudioConverter` filter
+    /// state across consecutive chunks (`.noDataNow`) and drains cleanly on
+    /// `flush()` (`.endOfStream`). Must be used from a single serial queue.
+    final class StreamingResampler {
+        private let targetRate: Double
+        private var sourceRate: Double = 0
+        private var srcFormat: AVAudioFormat?
+        private var dstFormat: AVAudioFormat?
+        private var converter: AVAudioConverter?
+
+        init(targetRate: Double = 16_000) {
+            self.targetRate = targetRate
+        }
+
+        func process(_ samples: [Float], sampleRate: Double) -> [Float] {
+            guard !samples.isEmpty, sampleRate > 0 else { return [] }
+
+            var prefix: [Float] = []
+            if sourceRate != 0 && sourceRate != sampleRate {
+                prefix = flush()
+            }
+
+            if sampleRate == targetRate {
+                sourceRate = sampleRate
+                return prefix.isEmpty ? samples : prefix + samples
+            }
+
+            if converter == nil || sourceRate != sampleRate {
+                guard let src = AVAudioFormat(
+                    commonFormat: .pcmFormatFloat32,
+                    sampleRate: sampleRate,
+                    channels: 1,
+                    interleaved: false
+                ),
+                let dst = AVAudioFormat(
+                    commonFormat: .pcmFormatFloat32,
+                    sampleRate: targetRate,
+                    channels: 1,
+                    interleaved: false
+                ),
+                let conv = AVAudioConverter(from: src, to: dst) else {
+                    return prefix
+                }
+                sourceRate = sampleRate
+                srcFormat = src
+                dstFormat = dst
+                converter = conv
+            }
+
+            guard let srcFormat, let dstFormat, let converter else { return prefix }
+
+            let srcFrameCount = AVAudioFrameCount(samples.count)
+            guard let srcBuffer = AVAudioPCMBuffer(pcmFormat: srcFormat, frameCapacity: srcFrameCount),
+                  let srcChannelData = srcBuffer.floatChannelData else {
+                return prefix
+            }
+            srcBuffer.frameLength = srcFrameCount
+            samples.withUnsafeBufferPointer { ptr in
+                guard let base = ptr.baseAddress else { return }
+                srcChannelData[0].update(from: base, count: samples.count)
+            }
+
+            let expectedFrames = Int(ceil(Double(samples.count) * (targetRate / sampleRate)))
+            let capacity = AVAudioFrameCount(max(512, expectedFrames + 256))
+            guard let dstBuffer = AVAudioPCMBuffer(pcmFormat: dstFormat, frameCapacity: capacity) else {
+                return prefix
+            }
+
+            var output = prefix
+            output.reserveCapacity(prefix.count + expectedFrames + 32)
+            var consumed = false
+
+            while true {
+                dstBuffer.frameLength = 0
+                var convError: NSError?
+                let status = converter.convert(to: dstBuffer, error: &convError) { _, outStatus in
+                    if consumed {
+                        outStatus.pointee = .noDataNow
+                        return nil
+                    }
+                    consumed = true
+                    outStatus.pointee = .haveData
+                    return srcBuffer
+                }
+
+                let produced = Int(dstBuffer.frameLength)
+                if produced > 0, let channelData = dstBuffer.floatChannelData {
+                    output.append(contentsOf: UnsafeBufferPointer(start: channelData[0], count: produced))
+                }
+
+                if status == .error || status == .inputRanDry || status == .endOfStream || produced == 0 {
+                    break
+                }
+            }
+
+            return output
+        }
+
+        func flush() -> [Float] {
+            guard let converter, let dstFormat else {
+                reset()
+                return []
+            }
+            defer { reset() }
+
+            guard let dstBuffer = AVAudioPCMBuffer(pcmFormat: dstFormat, frameCapacity: 4096) else {
+                return []
+            }
+
+            var output: [Float] = []
+            while true {
+                dstBuffer.frameLength = 0
+                var convError: NSError?
+                let status = converter.convert(to: dstBuffer, error: &convError) { _, outStatus in
+                    outStatus.pointee = .endOfStream
+                    return nil
+                }
+
+                let produced = Int(dstBuffer.frameLength)
+                if produced > 0, let channelData = dstBuffer.floatChannelData {
+                    output.append(contentsOf: UnsafeBufferPointer(start: channelData[0], count: produced))
+                }
+
+                if status == .error || status == .endOfStream || produced == 0 {
+                    break
+                }
+            }
+            return output
+        }
+
+        private func reset() {
+            sourceRate = 0
+            srcFormat = nil
+            dstFormat = nil
+            converter = nil
+        }
     }
 
     /// Check and request microphone permission.

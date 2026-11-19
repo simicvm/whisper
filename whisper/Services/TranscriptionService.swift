@@ -1,4 +1,5 @@
 import Foundation
+import os
 import MLX
 import MLXAudioSTT
 import MLXAudioCore
@@ -45,8 +46,55 @@ actor TranscriptionService {
         let model: any STTGenerationModel
     }
 
+    private struct NemotronModelBox: @unchecked Sendable {
+        let model: NemotronASRModel
+    }
+
+    private struct NemotronStreamBox: @unchecked Sendable {
+        let session: NemotronASRStreamSession
+    }
+
     /// Whether a model is currently loaded and ready.
     var isLoaded: Bool { model != nil }
+
+    /// Whether the currently loaded model supports incremental streaming during recording.
+    var supportsLiveStreaming: Bool { model is NemotronASRModel }
+
+    /// Starts an incremental streaming session for Nemotron 3.5 ASR models so
+    /// audio chunks can be encoded while the user is still speaking.
+    /// Returns `nil` for models that use offline post-recording transcription.
+    func beginStreamingSession() async throws -> LiveTranscriptionSession? {
+        try Task.checkCancellation()
+        try await acquireOperationTurn()
+
+        guard let nemotronModel = model as? NemotronASRModel else {
+            releaseOperationTurn()
+            return nil
+        }
+
+        let language = Self.generationParameters(for: .nemotron).language
+        let box = NemotronModelBox(model: nemotronModel)
+        let queue = inferenceQueue
+
+        let streamSession: NemotronStreamBox = await withCheckedContinuation { continuation in
+            queue.async {
+                let session = box.model.makeStreamSession(language: language)
+                continuation.resume(returning: NemotronStreamBox(session: session))
+            }
+        }
+
+        return LiveTranscriptionSession(
+            inferenceQueue: queue,
+            streamSession: streamSession.session,
+            onReleaseTurn: { [weak self] in
+                await self?.finishStreamingTurn()
+            }
+        )
+    }
+
+    private func finishStreamingTurn() {
+        releaseOperationTurn()
+    }
 
     /// Returns repo IDs that have a complete local snapshot.
     func downloadedModelRepoIDs(for repoIDs: [String]) async -> Set<String> {
@@ -728,6 +776,133 @@ actor TranscriptionService {
                 let text = output.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 continuation.resume(returning: text)
             }
+        }
+    }
+}
+
+/// Incremental streaming session for Nemotron 3.5 ASR.
+/// Resamples incoming microphone chunks and feeds them into `NemotronASRStreamSession`
+/// on `TranscriptionService.inferenceQueue` while recording is in progress.
+final class LiveTranscriptionSession: @unchecked Sendable {
+    /// Step size at 16 kHz (~320 ms) before pushing into the streaming encoder.
+    private static let stepSampleThreshold = 5_120
+
+    private let inferenceQueue: DispatchQueue
+    private let onReleaseTurn: @Sendable () async -> Void
+    private let stateLock = OSAllocatedUnfairLock(initialState: State())
+
+    private struct State {
+        var closed = false
+        var turnReleased = false
+    }
+
+    // Queue-confined state (accessed exclusively on `inferenceQueue`).
+    private var streamSession: NemotronASRStreamSession?
+    private let resampler = AudioRecorder.StreamingResampler(targetRate: 16_000)
+    private var pendingSamples: [Float] = []
+
+    init(
+        inferenceQueue: DispatchQueue,
+        streamSession: NemotronASRStreamSession,
+        onReleaseTurn: @escaping @Sendable () async -> Void
+    ) {
+        self.inferenceQueue = inferenceQueue
+        self.streamSession = streamSession
+        self.onReleaseTurn = onReleaseTurn
+        self.pendingSamples.reserveCapacity(Self.stepSampleThreshold * 2)
+    }
+
+    /// Enqueues a raw mono microphone chunk for resampling and incremental decoding.
+    /// Safe to call from the audio tap thread.
+    nonisolated func feed(samples: [Float], sampleRate: Double) {
+        guard !samples.isEmpty, sampleRate > 0 else { return }
+        guard !stateLock.withLock({ $0.closed }) else { return }
+
+        inferenceQueue.async { [self] in
+            guard !stateLock.withLock({ $0.closed }), let streamSession else { return }
+
+            let converted = resampler.process(samples, sampleRate: sampleRate)
+            guard !converted.isEmpty else { return }
+
+            pendingSamples.append(contentsOf: converted)
+            if pendingSamples.count >= Self.stepSampleThreshold {
+                let batch = pendingSamples
+                pendingSamples.removeAll(keepingCapacity: true)
+                streamSession.step(batch)
+            }
+        }
+    }
+
+    /// Flushes remaining buffered audio and finishes decoding, returning the final transcript.
+    func finish() async throws -> String {
+        let alreadyClosed = stateLock.withLock { state -> Bool in
+            if state.closed { return true }
+            state.closed = true
+            return false
+        }
+        guard !alreadyClosed else {
+            throw TranscriptionError.emptyResult
+        }
+
+        let text: String = await withCheckedContinuation { continuation in
+            inferenceQueue.async { [self] in
+                defer {
+                    streamSession = nil
+                    pendingSamples.removeAll()
+                    Memory.clearCache()
+                }
+                guard let streamSession else {
+                    continuation.resume(returning: "")
+                    return
+                }
+
+                let tail = resampler.flush()
+                if !tail.isEmpty {
+                    pendingSamples.append(contentsOf: tail)
+                }
+                if !pendingSamples.isEmpty {
+                    streamSession.step(pendingSamples)
+                    pendingSamples.removeAll()
+                }
+                streamSession.finish()
+                let decoded = streamSession.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                continuation.resume(returning: decoded)
+            }
+        }
+
+        await releaseTurnOnce()
+
+        guard !text.isEmpty else {
+            throw TranscriptionError.emptyResult
+        }
+        return text
+    }
+
+    /// Aborts the streaming session and frees carried encoder/decoder caches.
+    func cancel() async {
+        stateLock.withLock { $0.closed = true }
+
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            inferenceQueue.async { [self] in
+                _ = resampler.flush()
+                streamSession = nil
+                pendingSamples.removeAll()
+                Memory.clearCache()
+                continuation.resume()
+            }
+        }
+
+        await releaseTurnOnce()
+    }
+
+    private func releaseTurnOnce() async {
+        let shouldRelease = stateLock.withLock { state -> Bool in
+            if state.turnReleased { return false }
+            state.turnReleased = true
+            return true
+        }
+        if shouldRelease {
+            await onReleaseTurn()
         }
     }
 }

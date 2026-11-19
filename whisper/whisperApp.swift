@@ -28,6 +28,7 @@ struct WhisperApp: App {
     @State private var appActiveObserver: NSObjectProtocol?
     @State private var errorResetTask: Task<Void, Never>?
     @State private var inputRecoveryTask: Task<Void, Never>?
+    @State private var activeStreamSession: LiveTranscriptionSession?
 
     private static let maxRecordingDurationSeconds = AudioRecorder.defaultMaximumDuration
     private static let minimumSpeechDurationSeconds = 0.2
@@ -256,21 +257,47 @@ struct WhisperApp: App {
         cancelInputRecovery()
         _ = appState.transition(to: .starting)
 
+        let streamSession = try? await transcriptionService.beginStreamingSession()
+
+        // If the user already released the hotkey while preparing the streaming
+        // session, abort cleanly instead of starting a stuck recording.
+        guard hotkeyMonitor.isHeld, appState.phase == .starting else {
+            if let streamSession {
+                await streamSession.cancel()
+            }
+            if appState.phase == .starting {
+                _ = appState.transition(to: .idle)
+            }
+            return
+        }
+
         let audioLevelMeter = appState.audioLevelMeter
+        let onAudioChunk: (@Sendable ([Float], Double) -> Void)? = streamSession.map { session in
+            { samples, sampleRate in
+                session.feed(samples: samples, sampleRate: sampleRate)
+            }
+        }
+
         do {
             try audioRecorder.start(
                 onLevel: { (level: Float) in
                     audioLevelMeter.level = level
                 },
+                onAudioChunk: onAudioChunk,
                 onInputConfigurationChange: {
                     handleInputConfigurationChange()
                 }
             )
 
+            activeStreamSession = streamSession
             _ = appState.transition(to: .recording)
             overlayManager.show(appState: appState)
             startRecordingTimeout()
         } catch {
+            if let streamSession {
+                await streamSession.cancel()
+            }
+            activeStreamSession = nil
             cancelRecordingTimeout()
             appState.audioLevelMeter.level = 0
             _ = appState.transition(to: .error(error.localizedDescription))
@@ -352,7 +379,12 @@ struct WhisperApp: App {
     private func abortRecordingAfterInputChange() {
         cancelRecordingTimeout()
         cancelInputRecovery()
+        let streamSession = activeStreamSession
+        activeStreamSession = nil
         audioRecorder.stopDiscarding()
+        if let streamSession {
+            Task { await streamSession.cancel() }
+        }
         appState.audioLevelMeter.level = 0
         overlayManager.hide()
         _ = appState.transition(to: .error("Audio input changed. Try again."))
@@ -374,6 +406,8 @@ struct WhisperApp: App {
         }
         cancelInputRecovery()
 
+        let streamSession = activeStreamSession
+        activeStreamSession = nil
         let segments = audioRecorder.stopCapturingSegments()
         appState.audioLevelMeter.level = 0
 
@@ -382,6 +416,9 @@ struct WhisperApp: App {
             return partial + Double(segment.samples.count) / segment.sampleRate
         }
         guard rawDuration >= Self.minimumSpeechDurationSeconds else {
+            if let streamSession {
+                await streamSession.cancel()
+            }
             overlayManager.hide()
             _ = appState.transition(to: .error("Recording too short. Hold the hotkey briefly and try again."))
             resetAfterDelay(seconds: 2)
@@ -395,60 +432,67 @@ struct WhisperApp: App {
         let minimumSamples = Int(Self.minimumSpeechDurationSeconds * targetSampleRate)
 
         do {
-            // Resample, trim silence, and normalise off the MainActor so the
-            // UI and overlay stay responsive on long recordings.
-            let prepared = try await Task.detached(priority: .userInitiated) { () throws -> PreparedAudio in
-                let rawSamples = try AudioRecorder.finalizeSegments(
-                    segments,
-                    targetSampleRate: targetSampleRate
-                )
-                guard rawSamples.count >= minimumSamples else {
-                    return .tooShort
-                }
+            let text: String
+            if let streamSession {
+                // Audio was already resampled and encoded incrementally during
+                // recording; only flush the trailing partial chunk.
+                text = try await streamSession.finish()
+            } else {
+                // Resample, trim silence, and normalise off the MainActor so the
+                // UI and overlay stay responsive on long recordings.
+                let prepared = try await Task.detached(priority: .userInitiated) { () throws -> PreparedAudio in
+                    let rawSamples = try AudioRecorder.finalizeSegments(
+                        segments,
+                        targetSampleRate: targetSampleRate
+                    )
+                    guard rawSamples.count >= minimumSamples else {
+                        return .tooShort
+                    }
 
-                // Trim leading/trailing silence before inference. Only confident
-                // near-silence is rejected outright; uncertain audio (quiet,
-                // noisy, or compressed speech the VAD can't certify) goes to the
-                // model unmodified so it can make the final call.
+                    // Trim leading/trailing silence before inference. Only confident
+                    // near-silence is rejected outright; uncertain audio (quiet,
+                    // noisy, or compressed speech the VAD can't certify) goes to the
+                    // model unmodified so it can make the final call.
+                    let processed: [Float]
+                    switch AudioProcessing.trimSilence(
+                        from: rawSamples,
+                        sampleRate: targetSampleRate
+                    ) {
+                    case .silence:
+                        return .silence
+                    case .speech(let trimmed):
+                        processed = AudioProcessing.normalizeGain(trimmed)
+                    case .indeterminate(let audio):
+                        // Deliberately not normalised: boosting what may be pure
+                        // noise to peak level invites hallucinated transcriptions.
+                        processed = audio
+                    }
+
+                    // The active region may be shorter than the minimum after trimming.
+                    guard processed.count >= minimumSamples else {
+                        return .silence
+                    }
+                    return .ready(processed)
+                }.value
+
                 let processed: [Float]
-                switch AudioProcessing.trimSilence(
-                    from: rawSamples,
-                    sampleRate: targetSampleRate
-                ) {
+                switch prepared {
+                case .tooShort:
+                    overlayManager.hide()
+                    _ = appState.transition(to: .error("Recording too short. Hold the hotkey briefly and try again."))
+                    resetAfterDelay(seconds: 2)
+                    return
                 case .silence:
-                    return .silence
-                case .speech(let trimmed):
-                    processed = AudioProcessing.normalizeGain(trimmed)
-                case .indeterminate(let audio):
-                    // Deliberately not normalised: boosting what may be pure
-                    // noise to peak level invites hallucinated transcriptions.
+                    overlayManager.hide()
+                    _ = appState.transition(to: .error("No speech detected. Hold the hotkey, speak, then release."))
+                    resetAfterDelay(seconds: 2)
+                    return
+                case .ready(let audio):
                     processed = audio
                 }
 
-                // The active region may be shorter than the minimum after trimming.
-                guard processed.count >= minimumSamples else {
-                    return .silence
-                }
-                return .ready(processed)
-            }.value
-
-            let processed: [Float]
-            switch prepared {
-            case .tooShort:
-                overlayManager.hide()
-                _ = appState.transition(to: .error("Recording too short. Hold the hotkey briefly and try again."))
-                resetAfterDelay(seconds: 2)
-                return
-            case .silence:
-                overlayManager.hide()
-                _ = appState.transition(to: .error("No speech detected. Hold the hotkey, speak, then release."))
-                resetAfterDelay(seconds: 2)
-                return
-            case .ready(let audio):
-                processed = audio
+                text = try await transcriptionService.transcribe(audio: processed)
             }
-
-            let text = try await transcriptionService.transcribe(audio: processed)
 
             _ = appState.transition(to: .pasting)
             try await PasteController.paste(text)

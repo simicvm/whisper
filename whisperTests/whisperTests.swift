@@ -248,4 +248,27 @@ struct whisperTests {
         #expect(TranscriptionService.qwen3MaxTokens(audioSampleCount: 600 * 16_000) == 2048)
     }
 
+    @Test
+    func streamingResamplerMatchesExpectedLengthAcrossChunksAndRateSwitch() {
+        let resampler = AudioRecorder.StreamingResampler(targetRate: 16_000)
+        var out: [Float] = []
+
+        // 1 second of 48 kHz audio delivered in 1024-sample chunks (~16,000 samples).
+        let src48k = (0..<48_000).map { i -> Float in
+            0.4 * sin(2 * .pi * 440 * Float(i) / 48_000)
+        }
+        var offset = 0
+        while offset < src48k.count {
+            let end = min(offset + 1024, src48k.count)
+            out.append(contentsOf: resampler.process(Array(src48k[offset..<end]), sampleRate: 48_000))
+            offset = end
+        }
+        // Switch mid-stream to 16 kHz for 0.5 seconds (8,000 samples).
+        let src16k = [Float](repeating: 0.1, count: 8_000)
+        out.append(contentsOf: resampler.process(src16k, sampleRate: 16_000))
+        out.append(contentsOf: resampler.flush())
+
+        #expect(abs(out.count - 24_000) <= 64)
+    }
+
 }
