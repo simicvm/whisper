@@ -127,7 +127,12 @@ final class AudioRecorder: @unchecked Sendable {
         nativeSamples.removeAll()
         lock.unlock()
 
-        let converted = convertToTargetRate(segment, from: segmentRate)
+        let converted: [Float]
+        do {
+            converted = try Self.convertToTargetRate(segment, from: segmentRate, to: targetSampleRate)
+        } catch {
+            return .failed
+        }
         if !converted.isEmpty {
             lock.lock()
             completedSamples.append(contentsOf: converted)
@@ -228,12 +233,19 @@ final class AudioRecorder: @unchecked Sendable {
         }
     }
 
-    private func convertToTargetRate(_ samples: [Float], from rate: Double) -> [Float] {
-        guard !samples.isEmpty, rate > 0 else { return [] }
-        if rate == targetSampleRate {
+    static func convertToTargetRate(
+        _ samples: [Float],
+        from rate: Double,
+        to targetRate: Double = 16_000
+    ) throws -> [Float] {
+        guard !samples.isEmpty else { return [] }
+        guard rate > 0, targetRate > 0 else {
+            throw AudioRecorderError.resamplingFailed
+        }
+        if rate == targetRate {
             return samples
         }
-        return resample(samples, from: rate, to: targetSampleRate)
+        return try resample(samples, from: rate, to: targetRate)
     }
 
     /// Returns whether the engine is still running on the input used at start.
@@ -267,7 +279,7 @@ final class AudioRecorder: @unchecked Sendable {
     }
 
     /// Stop recording and return the captured audio samples resampled to 16kHz mono float32.
-    func stop() -> [Float] {
+    func stop() throws -> [Float] {
         lock.lock()
         isRecording = false
         let earlier = completedSamples
@@ -285,7 +297,8 @@ final class AudioRecorder: @unchecked Sendable {
         engine.stop()
 
         // Earlier segments are already at 16kHz; convert the live one.
-        return earlier + convertToTargetRate(captured, from: capturedRate)
+        let latest = try Self.convertToTargetRate(captured, from: capturedRate, to: targetSampleRate)
+        return earlier + latest
     }
 
     private func shouldReplaceEngine(for currentInput: InputFingerprint) -> Bool {
@@ -482,7 +495,14 @@ final class AudioRecorder: @unchecked Sendable {
     }
 
     /// Resample audio offline using AVAudioConverter (not in a real-time callback).
-    private func resample(_ samples: [Float], from srcRate: Double, to dstRate: Double) -> [Float] {
+    /// Drains the converter until `.endOfStream` so trailing filter-primed frames are not truncated.
+    static func resample(_ samples: [Float], from srcRate: Double, to dstRate: Double) throws -> [Float] {
+        guard !samples.isEmpty else { return [] }
+        guard srcRate > 0, dstRate > 0 else {
+            throw AudioRecorderError.resamplingFailed
+        }
+        guard srcRate != dstRate else { return samples }
+
         guard let srcFormat = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
             sampleRate: srcRate,
@@ -496,47 +516,63 @@ final class AudioRecorder: @unchecked Sendable {
             interleaved: false
         ),
         let converter = AVAudioConverter(from: srcFormat, to: dstFormat) else {
-            return samples
+            throw AudioRecorderError.resamplingFailed
         }
 
         let srcFrameCount = AVAudioFrameCount(samples.count)
         guard let srcBuffer = AVAudioPCMBuffer(pcmFormat: srcFormat, frameCapacity: srcFrameCount) else {
-            return samples
+            throw AudioRecorderError.resamplingFailed
         }
         srcBuffer.frameLength = srcFrameCount
-        if let channelData = srcBuffer.floatChannelData {
-            samples.withUnsafeBufferPointer { ptr in
-                channelData[0].update(from: ptr.baseAddress!, count: samples.count)
-            }
+        guard let srcChannelData = srcBuffer.floatChannelData else {
+            throw AudioRecorderError.resamplingFailed
+        }
+        samples.withUnsafeBufferPointer { ptr in
+            guard let base = ptr.baseAddress else { return }
+            srcChannelData[0].update(from: base, count: samples.count)
         }
 
-        let ratio = dstRate / srcRate
-        let dstFrameCount = AVAudioFrameCount(Double(srcFrameCount) * ratio) + 1
-        guard let dstBuffer = AVAudioPCMBuffer(pcmFormat: dstFormat, frameCapacity: dstFrameCount) else {
-            return samples
+        let expectedFrames = Int(ceil(Double(samples.count) * (dstRate / srcRate)))
+        let chunkCapacity = AVAudioFrameCount(max(4096, min(expectedFrames + 1024, 65_536)))
+        guard let dstBuffer = AVAudioPCMBuffer(pcmFormat: dstFormat, frameCapacity: chunkCapacity) else {
+            throw AudioRecorderError.resamplingFailed
         }
 
-        // Use the block-based API for offline conversion — works fine outside real-time callbacks
+        var output: [Float] = []
+        output.reserveCapacity(expectedFrames + 64)
+
         var consumed = false
-        var convError: NSError?
-        let status = converter.convert(to: dstBuffer, error: &convError) { _, outStatus in
-            if consumed {
-                outStatus.pointee = .endOfStream
-                return nil
+        while true {
+            dstBuffer.frameLength = 0
+            var convError: NSError?
+            let status = converter.convert(to: dstBuffer, error: &convError) { _, outStatus in
+                if consumed {
+                    outStatus.pointee = .endOfStream
+                    return nil
+                }
+                consumed = true
+                outStatus.pointee = .haveData
+                return srcBuffer
             }
-            consumed = true
-            outStatus.pointee = .haveData
-            return srcBuffer
+
+            if status == .error {
+                throw AudioRecorderError.resamplingFailed
+            }
+
+            let produced = Int(dstBuffer.frameLength)
+            if produced > 0, let channelData = dstBuffer.floatChannelData {
+                output.append(contentsOf: UnsafeBufferPointer(start: channelData[0], count: produced))
+            }
+
+            if status == .endOfStream || produced == 0 {
+                break
+            }
         }
 
-        if status == .error {
-            return samples
+        guard !output.isEmpty else {
+            throw AudioRecorderError.resamplingFailed
         }
-
-        guard let channelData = dstBuffer.floatChannelData else { return samples }
-        let count = Int(dstBuffer.frameLength)
-        let result = Array(UnsafeBufferPointer(start: channelData[0], count: count))
-        return result
+        return output
     }
 
     /// Check and request microphone permission.
@@ -557,6 +593,7 @@ enum AudioRecorderError: LocalizedError {
     case noMicrophone
     case alreadyRecording
     case audioHardware(OSStatus)
+    case resamplingFailed
 
     var errorDescription: String? {
         switch self {
@@ -566,6 +603,8 @@ enum AudioRecorderError: LocalizedError {
             return "A recording is already in progress"
         case .audioHardware(let status):
             return "Audio input is unavailable (Core Audio error \(status))"
+        case .resamplingFailed:
+            return "Failed to process recorded audio"
         }
     }
 }

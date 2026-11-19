@@ -88,4 +88,25 @@ struct whisperTests {
         #expect(abs(normalized[0] - 0.45) < 1e-4)
     }
 
+    @Test
+    func resamplerDrainsFullOutputAndRejectsInvalidRates() throws {
+        // 2 seconds at 48 kHz -> ~32,000 samples at 16 kHz.
+        let src48k = (0..<96_000).map { i -> Float in
+            0.5 * sin(2 * .pi * 440 * Float(i) / 48_000)
+        }
+        let dst16k = try AudioRecorder.resample(src48k, from: 48_000, to: 16_000)
+        #expect(abs(dst16k.count - 32_000) <= 64)
+
+        // 1 second at 44.1 kHz -> ~16,000 samples at 16 kHz.
+        let src44k = (0..<44_100).map { i -> Float in
+            0.5 * sin(2 * .pi * 440 * Float(i) / 44_100)
+        }
+        let dstFrom44k = try AudioRecorder.resample(src44k, from: 44_100, to: 16_000)
+        #expect(abs(dstFrom44k.count - 16_000) <= 64)
+
+        #expect(throws: AudioRecorderError.self) {
+            _ = try AudioRecorder.resample([0.1, 0.2], from: 0, to: 16_000)
+        }
+    }
+
 }

@@ -325,7 +325,7 @@ struct WhisperApp: App {
     @MainActor
     private func abortRecordingAfterInputChange() {
         cancelRecordingTimeout()
-        _ = audioRecorder.stop()
+        _ = try? audioRecorder.stop()
         appState.audioLevel = 0
         overlayManager.hide()
         _ = appState.transition(to: .error("Audio input changed. Try again."))
@@ -340,7 +340,16 @@ struct WhisperApp: App {
             cancelRecordingTimeout()
         }
 
-        let rawSamples = audioRecorder.stop()
+        let rawSamples: [Float]
+        do {
+            rawSamples = try audioRecorder.stop()
+        } catch {
+            appState.audioLevel = 0
+            overlayManager.hide()
+            _ = appState.transition(to: .error(error.localizedDescription))
+            resetAfterDelay()
+            return
+        }
         appState.audioLevel = 0
 
         let minimumSamples = Int(Self.minimumSpeechDurationSeconds * Self.transcriptionSampleRate)
