@@ -257,6 +257,7 @@ struct PasteController {
             throw PasteError.keyEventCreationFailed
         }
         keyDown.flags = .maskCommand
+        keyDown.setIntegerValueField(.eventSourceUserData, value: WhisperSyntheticEvent.userDataTag)
         keyDown.post(tap: .cghidEventTap)
 
         // Brief delay between down and up
@@ -271,6 +272,7 @@ struct PasteController {
             throw PasteError.keyEventCreationFailed
         }
         keyUp.flags = .maskCommand
+        keyUp.setIntegerValueField(.eventSourceUserData, value: WhisperSyntheticEvent.userDataTag)
         keyUp.post(tap: .cghidEventTap)
     }
 

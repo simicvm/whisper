@@ -177,4 +177,29 @@ struct whisperTests {
         #expect(abs(extracted[1] - (-0.5)) < 1e-4)
     }
 
+    @Test @MainActor
+    func hotkeyMonitorReconcilesGhostModifiersFromFlags() {
+        let monitor = HotkeyMonitor()
+        monitor.binding = HotkeyBinding(keyCodes: [HotkeyKeyCode.leftCommand, HotkeyKeyCode.leftControl])
+
+        var downCount = 0
+        monitor.onKeyDown = { downCount += 1 }
+
+        // Simulate a ghost Left Shift stuck after Secure Input.
+        monitor.pressedKeyCodes = [HotkeyKeyCode.leftShift, HotkeyKeyCode.function]
+
+        // Now user presses Left Command + Left Control (only those two bits set).
+        let flags: UInt64 = 0x0000_0008 | 0x0000_0001 // leftCommand | leftControl
+        monitor.reconcileModifiers(
+            flagsRaw: flags,
+            triggerType: .flagsChanged,
+            triggerKeyCode: HotkeyKeyCode.leftControl
+        )
+        monitor.updateHeldStateAndCallbacks()
+
+        #expect(monitor.pressedKeyCodes == [HotkeyKeyCode.leftCommand, HotkeyKeyCode.leftControl])
+        #expect(monitor.isHeld)
+        #expect(downCount == 1)
+    }
+
 }

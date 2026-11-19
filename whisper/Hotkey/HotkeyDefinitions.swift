@@ -41,6 +41,25 @@ enum HotkeyKeyCode {
         capsLock,
         function,
     ]
+
+    /// Modifiers whose physical left/right state is faithfully reflected in
+    /// the low 16 bits of `CGEventFlags.rawValue` on every keyboard event.
+    static let deviceModifierCodes: [UInt16] = [
+        leftCommand,
+        rightCommand,
+        leftShift,
+        rightShift,
+        leftOption,
+        rightOption,
+        leftControl,
+        rightControl,
+    ]
+}
+
+/// Tag attached to synthetic keyboard events posted by Whisper (e.g. Cmd+V)
+/// so the global event tap ignores its own generated input.
+nonisolated enum WhisperSyntheticEvent {
+    static let userDataTag: Int64 = 0x5748_5350_5041_5354 // "WHSPPAST"
 }
 
 struct HotkeyBinding: Codable, Hashable, Sendable {
@@ -363,6 +382,9 @@ struct HotkeyBinding: Codable, Hashable, Sendable {
 final class HotkeyMonitor {
     var onKeyDown: (() -> Void)?
     var onKeyUp: (() -> Void)?
+    /// Set to `true` while the user is recording a new hotkey binding so
+    /// non-modifier keys are not swallowed by the global event tap.
+    var isEditingBinding = false
     var binding: HotkeyBinding = .defaultBinding {
         didSet {
             guard binding != oldValue else { return }
@@ -381,7 +403,9 @@ final class HotkeyMonitor {
 
     fileprivate var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
-    fileprivate var pressedKeyCodes: Set<UInt16> = []
+    private var workspaceObservers: [NSObjectProtocol] = []
+    internal var pressedKeyCodes: Set<UInt16> = []
+    private var swallowedKeyCodes: Set<UInt16> = []
     private(set) var isHeld = false
 
     /// Whether the event tap was created successfully and is installed.
@@ -392,13 +416,16 @@ final class HotkeyMonitor {
     func start() {
         guard eventTap == nil else { return }
 
-        // Only intercept keyDown/keyUp when the binding includes non-modifier keys.
-        // This avoids adding overhead to every keystroke system-wide for modifier-only combos.
+        // Only intercept keyDown/keyUp (and use an active tap to swallow the
+        // regular key stroke) when the binding includes non-modifier keys.
+        // Modifier-only bindings stay `.listenOnly` to add zero overhead.
+        let needsRegularKeys = binding.hasNonModifierKeys
         var mask: CGEventMask = (1 << CGEventType.flagsChanged.rawValue)
-        if binding.hasNonModifierKeys {
+        if needsRegularKeys {
             mask |= (1 << CGEventType.keyDown.rawValue)
             mask |= (1 << CGEventType.keyUp.rawValue)
         }
+        let tapOptions: CGEventTapOptions = needsRegularKeys ? .defaultTap : .listenOnly
 
         // Use a weak reference via an Unmanaged pointer so the callback can reach us.
         let refcon = Unmanaged.passUnretained(self).toOpaque()
@@ -406,7 +433,7 @@ final class HotkeyMonitor {
         guard let tap = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
             place: .headInsertEventTap,
-            options: .listenOnly,
+            options: tapOptions,
             eventsOfInterest: mask,
             callback: hotkeyCallback,
             userInfo: refcon
@@ -418,9 +445,11 @@ final class HotkeyMonitor {
         runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
         CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
+        installWorkspaceObservers()
     }
 
     func stop() {
+        removeWorkspaceObservers()
         if let tap = eventTap {
             CGEvent.tapEnable(tap: tap, enable: false)
         }
@@ -430,6 +459,7 @@ final class HotkeyMonitor {
         eventTap = nil
         runLoopSource = nil
         pressedKeyCodes.removeAll()
+        swallowedKeyCodes.removeAll()
 
         if isHeld {
             isHeld = false
@@ -441,43 +471,125 @@ final class HotkeyMonitor {
         stop()
     }
 
-    /// Called from the C callback on the main run loop.
-    fileprivate func handleKeyboardEvent(type: CGEventType, event: CGEvent) {
-        let keyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
-
-        switch type {
-        case .keyDown:
-            pressedKeyCodes.insert(keyCode)
-        case .keyUp:
-            pressedKeyCodes.remove(keyCode)
-        case .flagsChanged:
-            // Caps Lock's flag reflects the latched lock state, not whether
-            // the key is held. Tracking it would leave a phantom "pressed"
-            // key in the set whenever Caps Lock is on, breaking exact-match
-            // detection for every binding. Ignore it entirely.
-            guard keyCode != HotkeyKeyCode.capsLock,
-                  HotkeyKeyCode.modifierCodes.contains(keyCode) else {
-                return
+    private func installWorkspaceObservers() {
+        guard workspaceObservers.isEmpty else { return }
+        let center = NSWorkspace.shared.notificationCenter
+        let names: [Notification.Name] = [
+            NSWorkspace.willSleepNotification,
+            NSWorkspace.sessionDidResignActiveNotification,
+        ]
+        workspaceObservers = names.map { name in
+            center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in
+                    self?.resetPressedState()
+                }
             }
-
-            let isPressed = HotkeyBinding.isModifierPressed(
-                keyCode: keyCode,
-                flagsRaw: event.flags.rawValue
-            )
-
-            if isPressed {
-                pressedKeyCodes.insert(keyCode)
-            } else {
-                pressedKeyCodes.remove(keyCode)
-            }
-        default:
-            return
         }
+    }
 
+    private func removeWorkspaceObservers() {
+        let center = NSWorkspace.shared.notificationCenter
+        for observer in workspaceObservers {
+            center.removeObserver(observer)
+        }
+        workspaceObservers.removeAll()
+    }
+
+    fileprivate func resetPressedState() {
+        pressedKeyCodes.removeAll()
+        swallowedKeyCodes.removeAll()
         updateHeldStateAndCallbacks()
     }
 
-    fileprivate func updateHeldStateAndCallbacks() {
+    /// Reconciles all tracked modifier keys against the authoritative `flagsRaw`
+    /// bitmask so missed key-up events (e.g. during Secure Input or lock screen)
+    /// cannot leave ghost modifiers stuck in `pressedKeyCodes`.
+    internal func reconcileModifiers(
+        flagsRaw: UInt64,
+        triggerType: CGEventType,
+        triggerKeyCode: UInt16
+    ) {
+        for code in HotkeyKeyCode.deviceModifierCodes {
+            if HotkeyBinding.isModifierPressed(keyCode: code, flagsRaw: flagsRaw) {
+                pressedKeyCodes.insert(code)
+            } else {
+                pressedKeyCodes.remove(code)
+            }
+        }
+
+        // `maskSecondaryFn` is also set on arrow/F-key events, so only insert
+        // `function` on an explicit Fn `flagsChanged`, but always clear it when
+        // the flag drops.
+        let fnFlagDown = HotkeyBinding.isModifierPressed(
+            keyCode: HotkeyKeyCode.function,
+            flagsRaw: flagsRaw
+        )
+        if !fnFlagDown {
+            pressedKeyCodes.remove(HotkeyKeyCode.function)
+        } else if triggerType == .flagsChanged && triggerKeyCode == HotkeyKeyCode.function {
+            pressedKeyCodes.insert(HotkeyKeyCode.function)
+        }
+    }
+
+    /// Removes any tracked non-modifier keys that the HID state reports as no
+    /// longer physically held (e.g. released while Secure Input was active).
+    private func pruneStaleNonModifierKeys() {
+        guard !pressedKeyCodes.isEmpty else { return }
+        for code in pressedKeyCodes where !HotkeyKeyCode.modifierCodes.contains(code) {
+            if !CGEventSource.keyState(.combinedSessionState, key: CGKeyCode(code)) {
+                pressedKeyCodes.remove(code)
+                swallowedKeyCodes.remove(code)
+            }
+        }
+    }
+
+    /// Called from the C callback on the main run loop.
+    /// Returns `true` if the event should be swallowed (suppressed from reaching
+    /// the frontmost app).
+    fileprivate func handleKeyboardEvent(type: CGEventType, event: CGEvent) -> Bool {
+        let keyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
+        let flagsRaw = event.flags.rawValue
+
+        reconcileModifiers(flagsRaw: flagsRaw, triggerType: type, triggerKeyCode: keyCode)
+
+        switch type {
+        case .keyDown:
+            if !HotkeyKeyCode.modifierCodes.contains(keyCode) {
+                pressedKeyCodes.insert(keyCode)
+            }
+        case .keyUp:
+            pressedKeyCodes.remove(keyCode)
+        case .flagsChanged:
+            pruneStaleNonModifierKeys()
+        default:
+            return false
+        }
+
+        updateHeldStateAndCallbacks()
+
+        // Swallow only non-modifier keys belonging to the active push-to-talk
+        // chord so bindings like Option+Space don't type into the focused app.
+        guard !isEditingBinding,
+              binding.hasNonModifierKeys,
+              !HotkeyKeyCode.modifierCodes.contains(keyCode) else {
+            return false
+        }
+
+        switch type {
+        case .keyDown:
+            if isHeld && binding.keyCodeSet.contains(keyCode) {
+                swallowedKeyCodes.insert(keyCode)
+                return true
+            }
+            return false
+        case .keyUp:
+            return swallowedKeyCodes.remove(keyCode) != nil
+        default:
+            return false
+        }
+    }
+
+    internal func updateHeldStateAndCallbacks() {
         let shouldBeHeld = !binding.isEmpty && pressedKeyCodes == binding.keyCodeSet
 
         if shouldBeHeld && !isHeld {
@@ -505,8 +617,7 @@ private func hotkeyCallback(
     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
         if let refcon = refcon {
             let monitor = Unmanaged<HotkeyMonitor>.fromOpaque(refcon).takeUnretainedValue()
-            monitor.pressedKeyCodes.removeAll()
-            monitor.updateHeldStateAndCallbacks()
+            monitor.resetPressedState()
             if let tap = monitor.eventTap {
                 CGEvent.tapEnable(tap: tap, enable: true)
             }
@@ -521,8 +632,12 @@ private func hotkeyCallback(
         return Unmanaged.passUnretained(event)
     }
 
-    let monitor = Unmanaged<HotkeyMonitor>.fromOpaque(refcon).takeUnretainedValue()
-    monitor.handleKeyboardEvent(type: type, event: event)
+    // Ignore synthetic events posted by Whisper itself (e.g. simulated Cmd+V).
+    if event.getIntegerValueField(.eventSourceUserData) == WhisperSyntheticEvent.userDataTag {
+        return Unmanaged.passUnretained(event)
+    }
 
-    return Unmanaged.passUnretained(event)
+    let monitor = Unmanaged<HotkeyMonitor>.fromOpaque(refcon).takeUnretainedValue()
+    let shouldSwallow = monitor.handleKeyboardEvent(type: type, event: event)
+    return shouldSwallow ? nil : Unmanaged.passUnretained(event)
 }

@@ -49,6 +49,7 @@ struct WhisperApp: App {
                 },
                 onHotkeyEditorPresentedChange: { isPresented in
                     appState.isEditingHotkey = isPresented
+                    hotkeyMonitor.isEditingBinding = isPresented
                 },
                 runOnStartupEnabled: appState.runOnStartupEnabled,
                 onRunOnStartupToggle: {

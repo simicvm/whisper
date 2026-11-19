@@ -447,9 +447,10 @@ struct MenuBarView: View {
             guard keyCode != HotkeyKeyCode.capsLock,
                   HotkeyKeyCode.modifierCodes.contains(keyCode) else { return }
 
+            let flagsRaw = event.cgEvent?.flags.rawValue ?? UInt64(event.modifierFlags.rawValue)
             let isPressed = HotkeyBinding.isModifierPressed(
                 keyCode: keyCode,
-                flagsRaw: UInt64(event.modifierFlags.rawValue)
+                flagsRaw: flagsRaw
             )
 
             if isPressed {
