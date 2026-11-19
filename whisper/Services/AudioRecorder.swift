@@ -38,6 +38,7 @@ final class AudioRecorder: @unchecked Sendable {
     private var recordingDeviceID: AudioDeviceID?
     private let lock = NSLock()
     private var isRecording = false
+    private var reachedSampleLimit = false
     private var onLevel: (@Sendable (Float) -> Void)?
     private var onInputConfigurationChange: (@MainActor @Sendable () -> Void)?
     private var didReportInputConfigurationChange = false
@@ -79,6 +80,7 @@ final class AudioRecorder: @unchecked Sendable {
         completedSamples.removeAll()
         nativeSamples.removeAll()
         isRecording = true
+        reachedSampleLimit = false
         self.onLevel = onLevel
         self.onInputConfigurationChange = onInputConfigurationChange
         lock.unlock()
@@ -114,9 +116,15 @@ final class AudioRecorder: @unchecked Sendable {
     func recoverFromConfigurationChange() -> ConfigurationRecovery {
         lock.lock()
         let recording = isRecording
+        let limitReached = reachedSampleLimit
         lock.unlock()
 
         guard recording, let recordingDeviceID else { return .failed }
+        // Recording already hit the maximum duration — keep the captured audio
+        // intact rather than restarting the engine or aborting the session.
+        if limitReached {
+            return .recovered
+        }
         guard let currentInput = try? Self.currentInputFingerprint() else { return .retry }
         guard currentInput.deviceID == recordingDeviceID else { return .failed }
 
@@ -206,7 +214,7 @@ final class AudioRecorder: @unchecked Sendable {
                 }
 
                 self.lock.lock()
-                if self.isRecording, self.segmentID == segment {
+                if self.isRecording, !self.reachedSampleLimit, self.segmentID == segment {
                     let remaining = segmentSampleLimit - self.nativeSamples.count
 
                     if remaining > 0 {
@@ -214,10 +222,10 @@ final class AudioRecorder: @unchecked Sendable {
                             self.nativeSamples.append(contentsOf: bufferPointer)
                         } else {
                             self.nativeSamples.append(contentsOf: bufferPointer.prefix(remaining))
-                            self.isRecording = false
+                            self.reachedSampleLimit = true
                         }
                     } else {
-                        self.isRecording = false
+                        self.reachedSampleLimit = true
                     }
                 }
                 self.lock.unlock()
@@ -285,6 +293,7 @@ final class AudioRecorder: @unchecked Sendable {
     func stop() throws -> [Float] {
         lock.lock()
         isRecording = false
+        reachedSampleLimit = false
         let earlier = completedSamples
         let captured = nativeSamples
         let capturedRate = nativeSampleRate
@@ -333,6 +342,7 @@ final class AudioRecorder: @unchecked Sendable {
     private func cleanUpFailedStart() {
         lock.lock()
         isRecording = false
+        reachedSampleLimit = false
         completedSamples.removeAll()
         nativeSamples.removeAll()
         onLevel = nil
@@ -387,7 +397,7 @@ final class AudioRecorder: @unchecked Sendable {
 
         lock.lock()
         let callback: (@MainActor @Sendable () -> Void)?
-        if isRecording, !didReportInputConfigurationChange {
+        if isRecording, !reachedSampleLimit, !didReportInputConfigurationChange {
             didReportInputConfigurationChange = true
             callback = onInputConfigurationChange
         } else {
