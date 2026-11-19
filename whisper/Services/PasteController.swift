@@ -6,13 +6,9 @@ import Carbon.HIToolbox
 @MainActor
 struct PasteController {
 
-    /// Time to wait after writing to the pasteboard before simulating Cmd+V.
-    /// Gives the system pasteboard server time to propagate the change.
-    private static let pasteboardSettleDelay: Duration = .milliseconds(50)
-
     /// Time to wait after simulating Cmd+V before restoring the original clipboard.
-    /// Must be long enough for the target application to read the pasteboard.
-    /// Slow consumers (rich text editors, remote desktop clients) may need more.
+    /// Runs asynchronously in the background so the app returns to idle right
+    /// after Cmd+V is posted.
     private static let pasteCompletionDelay: Duration = .milliseconds(400)
 
     /// Brief gap between the Cmd+V key-down and key-up events so the target
@@ -23,8 +19,20 @@ struct PasteController {
     /// before simulating Cmd+V anyway.
     private static let modifierReleaseTimeout: Duration = .seconds(2)
 
+    /// Maximum character count for falling back to `kAXValueAttribute` when a
+    /// focused element does not support `kAXStringForRangeParameterizedAttribute`.
+    private static let maxFallbackAXCharacterCount = 10_000
+
+    /// Upper bound on total clipboard bytes snapshotted before pasting so huge
+    /// images or rich documents don't stall the main thread or bloat memory.
+    private static let maxSnapshotBytes = 10 * 1024 * 1024
+
+    private static var pendingRestoreTask: Task<Void, Never>?
+    private static var pendingRestoreState: (snapshot: PasteboardSnapshot, expectedChangeCount: Int)?
+
     /// Paste text into the active application.
-    /// Saves and restores the original clipboard contents.
+    /// Saves and restores the original clipboard contents asynchronously so
+    /// the caller does not block waiting for the restore window.
     static func paste(_ text: String) async throws {
         guard hasAccessibilityPermission else {
             throw PasteError.accessibilityPermissionRequired
@@ -33,7 +41,21 @@ struct PasteController {
         guard !text.isEmpty else { return }
 
         let pasteboard = NSPasteboard.general
-        let snapshot = capturePasteboardSnapshot(from: pasteboard)
+
+        // If a previous dictation's restore is still pending and nothing else
+        // modified the clipboard, reuse the original pre-dictation snapshot.
+        let snapshot: PasteboardSnapshot
+        if let pending = pendingRestoreState, pasteboard.changeCount == pending.expectedChangeCount {
+            pendingRestoreTask?.cancel()
+            pendingRestoreTask = nil
+            pendingRestoreState = nil
+            snapshot = pending.snapshot
+        } else {
+            pendingRestoreTask?.cancel()
+            pendingRestoreTask = nil
+            pendingRestoreState = nil
+            snapshot = capturePasteboardSnapshot(from: pasteboard)
+        }
 
         // Prepend a space if the cursor sits right after non-whitespace text
         let finalText = shouldPrependSpace() ? " \(text)" : text
@@ -51,9 +73,6 @@ struct PasteController {
 
         let stagedChangeCount = pasteboard.changeCount
 
-        // Small delay to ensure pasteboard is updated
-        try? await Task.sleep(for: pasteboardSettleDelay)
-
         // The push-to-talk combo is modifier-based, so for fast transcriptions
         // (or the max-duration timeout) we can get here while the user still
         // holds part of the combo. The hardware modifier state can then merge
@@ -66,13 +85,34 @@ struct PasteController {
         // Leaving it on the pasteboard lets the user paste it manually.
         try await simulateCmdV()
 
-        // Restore original pasteboard after paste completes
-        try? await Task.sleep(for: pasteCompletionDelay)
-        restorePasteboard(
-            snapshot,
-            to: pasteboard,
-            expectedChangeCount: stagedChangeCount
-        )
+        // Restore original pasteboard in the background after the target app
+        // has had time to consume Cmd+V, without blocking the next dictation.
+        schedulePasteboardRestore(snapshot: snapshot, expectedChangeCount: stagedChangeCount)
+    }
+
+    private static func schedulePasteboardRestore(
+        snapshot: PasteboardSnapshot,
+        expectedChangeCount: Int
+    ) {
+        pendingRestoreTask?.cancel()
+        pendingRestoreState = (snapshot, expectedChangeCount)
+        pendingRestoreTask = Task { @MainActor in
+            do {
+                try await Task.sleep(for: pasteCompletionDelay)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            restorePasteboard(
+                snapshot,
+                to: NSPasteboard.general,
+                expectedChangeCount: expectedChangeCount
+            )
+            if pendingRestoreState?.expectedChangeCount == expectedChangeCount {
+                pendingRestoreState = nil
+                pendingRestoreTask = nil
+            }
+        }
     }
 
     /// Check if the app has Accessibility permission (required for CGEvent posting).
@@ -110,20 +150,8 @@ struct PasteController {
         }
         let element = unsafeBitCast(focusedRef, to: AXUIElement.self)
 
-        // Read the element's text value
-        var valueRef: AnyObject?
-        guard AXUIElementCopyAttributeValue(
-            element,
-            kAXValueAttribute as CFString,
-            &valueRef
-        ) == .success,
-              let text = valueRef as? String,
-              !text.isEmpty
-        else {
-            return false
-        }
-
-        // Read the selected text range (cursor position)
+        // Read the selected text range (cursor position) FIRST so we avoid
+        // fetching any text at all when the cursor is at index 0.
         var rangeRef: AnyObject?
         guard AXUIElementCopyAttributeValue(
             element,
@@ -147,7 +175,51 @@ struct PasteController {
         }
 
         let cursorPosition = range.location
-        guard cursorPosition > 0, cursorPosition <= text.utf16.count else {
+        guard cursorPosition > 0 else {
+            return false
+        }
+
+        // Fast O(1) path: request only the 1–2 UTF-16 code units right before
+        // the cursor (2 units cover both BMP characters and surrogate pairs).
+        let prefixLength = min(2, cursorPosition)
+        var prefixRange = CFRange(location: cursorPosition - prefixLength, length: prefixLength)
+        if let axPrefixRange = AXValueCreate(.cfRange, &prefixRange) {
+            var prefixRef: AnyObject?
+            if AXUIElementCopyParameterizedAttributeValue(
+                element,
+                kAXStringForRangeParameterizedAttribute as CFString,
+                axPrefixRange,
+                &prefixRef
+            ) == .success,
+               let prefixText = prefixRef as? String,
+               let charBeforeCursor = prefixText.last {
+                return !charBeforeCursor.isWhitespace
+            }
+        }
+
+        // Fallback for elements that don't support parameterized range queries:
+        // bail out if the document is large so we never pull megabytes over IPC.
+        var charCountRef: AnyObject?
+        if AXUIElementCopyAttributeValue(
+            element,
+            kAXNumberOfCharactersAttribute as CFString,
+            &charCountRef
+        ) == .success,
+           let charCount = charCountRef as? Int,
+           charCount > maxFallbackAXCharacterCount {
+            return false
+        }
+
+        var valueRef: AnyObject?
+        guard AXUIElementCopyAttributeValue(
+            element,
+            kAXValueAttribute as CFString,
+            &valueRef
+        ) == .success,
+              let text = valueRef as? String,
+              !text.isEmpty,
+              cursorPosition <= text.utf16.count
+        else {
             return false
         }
 
@@ -196,20 +268,33 @@ struct PasteController {
     }()
 
     private static func capturePasteboardSnapshot(from pasteboard: NSPasteboard) -> PasteboardSnapshot {
-        let snapshots: [PasteboardItemSnapshot] = (pasteboard.pasteboardItems ?? []).compactMap { item in
+        var totalBytes = 0
+        var snapshots: [PasteboardItemSnapshot] = []
+
+        for item in pasteboard.pasteboardItems ?? [] {
             // Never capture concealed (password manager) or transient pasteboard items.
             let types = item.types
             if types.contains(concealedType) || types.contains(transientType) {
-                return nil
+                continue
             }
 
-            let payloads = types.compactMap { type -> PasteboardPayload? in
-                guard !promisedDataTypes.contains(type.rawValue) else { return nil }
-                guard let data = item.data(forType: type) else { return nil }
-                return PasteboardPayload(type: type, data: data)
+            // Skip uncompressed TIFF when PNG is already offered on the same
+            // item — rasterizing a TIFF can stall the source app and multiply RAM.
+            let hasPNG = types.contains(.png)
+            var payloads: [PasteboardPayload] = []
+
+            for type in types {
+                guard !promisedDataTypes.contains(type.rawValue) else { continue }
+                if hasPNG && type == .tiff { continue }
+                guard let data = item.data(forType: type) else { continue }
+                guard totalBytes + data.count <= maxSnapshotBytes else { continue }
+                totalBytes += data.count
+                payloads.append(PasteboardPayload(type: type, data: data))
             }
-            guard !payloads.isEmpty else { return nil }
-            return PasteboardItemSnapshot(payloads: payloads)
+
+            if !payloads.isEmpty {
+                snapshots.append(PasteboardItemSnapshot(payloads: payloads))
+            }
         }
 
         return PasteboardSnapshot(items: snapshots)
