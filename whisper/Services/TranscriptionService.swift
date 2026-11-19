@@ -10,9 +10,12 @@ import HuggingFace
 /// Inference itself runs on a dedicated queue so long synchronous
 /// `model.generate(...)` work does not execute on Swift's cooperative executor.
 actor TranscriptionService {
+    private static let metalCacheLimitBytes = 64 * 1024 * 1024
+
     private var model: (any STTGenerationModel)?
-    private var generationParameters: STTGenerateParameters?
+    private var currentFamily: STTModelFamily?
     private var currentRepoID: String?
+    private var didConfigureMetalCacheLimit = false
 
     /// Guards stale completions for actor-owned model state.
     /// Kept separate from `WhisperApp.modelLoadGeneration`, which protects UI updates.
@@ -98,6 +101,11 @@ actor TranscriptionService {
             return
         }
 
+        if !didConfigureMetalCacheLimit {
+            Memory.cacheLimit = Self.metalCacheLimitBytes
+            didConfigureMetalCacheLimit = true
+        }
+
         // Unload previous model
         invalidateLoadedModel()
         let generation = loadGeneration
@@ -118,7 +126,7 @@ actor TranscriptionService {
         }
 
         model = loaded
-        generationParameters = Self.generationParameters(for: definition.family)
+        currentFamily = definition.family
         currentRepoID = repoID
     }
 
@@ -135,10 +143,30 @@ actor TranscriptionService {
         }
     }
 
-    private static func generationParameters(for family: STTModelFamily) -> STTGenerateParameters {
+    internal static func qwen3MaxTokens(
+        audioSampleCount: Int?,
+        sampleRate: Double = 16_000
+    ) -> Int {
+        guard let audioSampleCount, sampleRate > 0 else { return 2048 }
+        let audioSeconds = Double(audioSampleCount) / sampleRate
+        return min(2048, max(64, Int((audioSeconds * 12.0).rounded(.up)) + 64))
+    }
+
+    internal static func generationParameters(
+        for family: STTModelFamily,
+        audioSampleCount: Int? = nil,
+        sampleRate: Double = 16_000
+    ) -> STTGenerateParameters {
         switch family {
         case .qwen3:
-            return STTGenerateParameters(language: "English")
+            // Cap maxTokens proportionally to audio length (~3-5 spoken tokens/s
+            // with ~3x headroom) so a repetition hallucination cannot run up to
+            // the 8,192-token default and stall for minutes.
+            let maxTokens = qwen3MaxTokens(
+                audioSampleCount: audioSampleCount,
+                sampleRate: sampleRate
+            )
+            return STTGenerateParameters(maxTokens: maxTokens, language: "English")
         case .nemotron:
             // Must be a prompt_dictionary key from the checkpoint config
             // ("en", not "English"); unrecognized keys silently fall back
@@ -491,7 +519,7 @@ actor TranscriptionService {
         defer { releaseOperationTurn() }
         try Task.checkCancellation()
 
-        guard let model, let generationParameters else {
+        guard let model, let currentFamily else {
             throw TranscriptionError.modelNotLoaded
         }
 
@@ -501,9 +529,15 @@ actor TranscriptionService {
 
         try Task.checkCancellation()
 
+        let parameters = Self.generationParameters(
+            for: currentFamily,
+            audioSampleCount: audio.count,
+            sampleRate: Double(model.sampleRate)
+        )
+
         let text = await runInference(
             model: model,
-            parameters: generationParameters,
+            parameters: parameters,
             audio: audio
         )
 
@@ -519,7 +553,7 @@ actor TranscriptionService {
     private func invalidateLoadedModel() {
         loadGeneration &+= 1
         model = nil
-        generationParameters = nil
+        currentFamily = nil
         currentRepoID = nil
         Memory.clearCache()
     }
@@ -554,6 +588,7 @@ actor TranscriptionService {
 
         return await withCheckedContinuation { continuation in
             inferenceQueue.async {
+                defer { Memory.clearCache() }
                 let mlxAudio = MLXArray(request.audio)
                 let output = request.model.generate(
                     audio: mlxAudio,

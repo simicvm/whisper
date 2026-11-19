@@ -241,4 +241,11 @@ struct whisperTests {
         #expect(TranscriptionService.hasCompleteModelSnapshotSync(at: dir, family: .qwen3))
     }
 
+    @Test
+    func qwen3MaxTokensScalesWithAudioDuration() {
+        #expect(TranscriptionService.qwen3MaxTokens(audioSampleCount: 16_000) == 76)
+        #expect(TranscriptionService.qwen3MaxTokens(audioSampleCount: 90 * 16_000) == 1144)
+        #expect(TranscriptionService.qwen3MaxTokens(audioSampleCount: 600 * 16_000) == 2048)
+    }
+
 }
