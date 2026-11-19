@@ -25,7 +25,7 @@ struct RecordingOverlayView: View {
     var body: some View {
         Group {
             if isVisible {
-                TimelineView(.animation) { context in
+                TimelineView(.animation(minimumInterval: frameInterval)) { context in
                     let time = context.date.timeIntervalSinceReferenceDate
                     gradientCircle(at: clock.advance(to: time, speed: currentSpeed))
                 }
@@ -40,13 +40,19 @@ struct RecordingOverlayView: View {
         appState.phase == .recording || appState.phase == .transcribing
     }
 
+    /// Cap frame rate to 30 fps while recording and 15 fps during transcription
+    /// so the 32 pt indicator does not compete with MLX for the Metal GPU.
+    private var frameInterval: TimeInterval {
+        appState.phase == .transcribing ? (1.0 / 15.0) : (1.0 / 30.0)
+    }
+
     @ViewBuilder
     private func gradientCircle(at phase: Double) -> some View {
         MeshGradient(
             width: 4,
             height: 4,
             points: meshPoints(at: phase),
-            colors: meshColors
+            colors: Self.meshColors
         )
         .frame(width: circleSize * 1.5, height: circleSize * 1.5)
         .frame(width: circleSize, height: circleSize)
@@ -77,7 +83,7 @@ struct RecordingOverlayView: View {
         if appState.phase == .transcribing {
             return 0.15
         }
-        return 0.15 + Double(appState.audioLevel) * 4.85
+        return 0.15 + Double(appState.audioLevelMeter.level) * 4.85
     }
 
     /// Integrates phase over time at a variable speed.
@@ -150,8 +156,7 @@ struct RecordingOverlayView: View {
     // MARK: - Colors (4×4)
 
     /// Sixteen vibrant colours arranged across the 4×4 mesh grid.
-    private var meshColors: [Color] {
-        [
+    private static let meshColors: [Color] = [
             // Row 0
             Color(hue: 0.83, saturation: 0.90, brightness: 0.95), // violet
             Color(hue: 0.55, saturation: 0.85, brightness: 0.95), // cyan
@@ -176,5 +181,4 @@ struct RecordingOverlayView: View {
             Color(hue: 0.12, saturation: 0.85, brightness: 1.00), // amber
             Color(hue: 0.80, saturation: 0.75, brightness: 0.95), // lavender
         ]
-    }
 }

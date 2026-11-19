@@ -2,50 +2,38 @@ import AppKit
 import SwiftUI
 
 /// Manages the lifecycle of the floating recording indicator panel.
+/// Reuses a single `FloatingPanel` instance across recordings to avoid
+/// repeatedly allocating `NSPanel`, `NSHostingView`, and Metal surfaces.
 @MainActor
 final class OverlayManager {
-    private var panel: FloatingPanel?
+    private var panel: FloatingPanel<RecordingOverlayView>?
     private var isPresented = false
-    private let overlaySize = CGSize(width: RecordingOverlayView.circleDiameter, height: RecordingOverlayView.circleDiameter)
+    private let overlaySize = CGSize(
+        width: RecordingOverlayView.circleDiameter,
+        height: RecordingOverlayView.circleDiameter
+    )
 
     func show(appState: AppState) {
         if panel == nil {
-            let binding = Binding<Bool>(
-                get: { [weak self] in
-                    self?.isPresented ?? false
-                },
-                set: { [weak self] newValue in
-                    guard let self else { return }
-                    self.isPresented = newValue
-                    if !newValue {
-                        self.panel = nil
-                    }
-                }
-            )
-
             let contentRect = NSRect(origin: .zero, size: overlaySize)
-            let newPanel = FloatingPanel(
-                view: {
-                    RecordingOverlayView(appState: appState)
-                },
-                contentRect: contentRect,
-                isPresented: binding
+            panel = FloatingPanel(
+                rootView: RecordingOverlayView(appState: appState),
+                contentRect: contentRect
             )
-            newPanel.positionBottomCenter()
-            panel = newPanel
-        } else {
-            panel?.updateView {
-                RecordingOverlayView(appState: appState)
-            }
         }
 
-        isPresented = true
-        panel?.orderFrontRegardless()
+        guard let panel else { return }
+
+        if !isPresented {
+            panel.positionBottomCenter()
+            isPresented = true
+            panel.orderFrontRegardless()
+        }
     }
 
     func hide() {
+        guard isPresented else { return }
         isPresented = false
-        panel?.close()
-        panel = nil
+        panel?.orderOut(nil)
     }
 }

@@ -1,5 +1,19 @@
+import os
 import SwiftUI
 import Observation
+
+/// Thread-safe, non-observed container for the live microphone level.
+/// Written directly from the audio tap thread and polled by `TimelineView`
+/// on each animation frame so audio callbacks never spawn `MainActor` tasks
+/// or trigger extra SwiftUI invalidations.
+final class AudioLevelMeter: Sendable {
+    private let storage = OSAllocatedUnfairLock<Float>(initialState: 0)
+
+    var level: Float {
+        get { storage.withLock { $0 } }
+        set { storage.withLock { $0 = newValue } }
+    }
+}
 
 /// The phases of the app's push-to-talk state machine.
 enum AppPhase: Equatable {
@@ -59,8 +73,9 @@ final class AppState {
     var accessibilityPermission: PermissionStatus = .unknown
     var runOnStartupEnabled = false
     var runOnStartupError: String?
-    /// Real-time microphone audio level (0–1), updated from the audio tap.
-    var audioLevel: Float = 0
+    /// Real-time microphone audio level (0–1), written from the audio tap
+    /// without triggering `@Observable` invalidations.
+    @ObservationIgnored let audioLevelMeter = AudioLevelMeter()
 
     /// Brief status text shown in the menu bar dropdown.
     var statusText: String {

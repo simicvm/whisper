@@ -1,18 +1,15 @@
 import AppKit
 import SwiftUI
 
-/// A floating, non-activating panel adapted from a blog-style NSPanel implementation.
-final class FloatingPanel: NSPanel {
-    @Binding private var isPresented: Bool
-    private let hostingView: NSHostingView<AnyView>
+/// A floating, non-activating borderless panel reused across recordings.
+final class FloatingPanel<Content: View>: NSPanel {
+    private let hostingView: NSHostingView<Content>
 
     init(
-        @ViewBuilder view: () -> some View,
-        contentRect: NSRect,
-        isPresented: Binding<Bool>
+        rootView: Content,
+        contentRect: NSRect
     ) {
-        self._isPresented = isPresented
-        self.hostingView = NSHostingView(rootView: AnyView(view()))
+        self.hostingView = NSHostingView(rootView: rootView)
 
         super.init(
             contentRect: contentRect,
@@ -37,20 +34,6 @@ final class FloatingPanel: NSPanel {
         contentView = hostingView
     }
 
-    func updateView(@ViewBuilder _ view: () -> some View) {
-        hostingView.rootView = AnyView(view())
-    }
-
-    override func resignMain() {
-        super.resignMain()
-        close()
-    }
-
-    override func close() {
-        super.close()
-        isPresented = false
-    }
-
     override var canBecomeKey: Bool {
         false
     }
@@ -59,9 +42,15 @@ final class FloatingPanel: NSPanel {
         false
     }
 
-    /// Position the panel at the bottom-center of the main screen.
+    /// Position the panel at the bottom-center of the active screen (the screen
+    /// containing the cursor, falling back to the main screen).
     func positionBottomCenter() {
-        guard let screen = NSScreen.main else { return }
+        let mouseLocation = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { NSMouseInRect(mouseLocation, $0.frame, false) }
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+        guard let screen else { return }
+
         let screenFrame = screen.visibleFrame
         let x = screenFrame.midX - (frame.width / 2)
         let y = screenFrame.minY + 15

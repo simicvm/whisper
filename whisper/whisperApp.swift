@@ -256,12 +256,11 @@ struct WhisperApp: App {
         cancelInputRecovery()
         _ = appState.transition(to: .starting)
 
+        let audioLevelMeter = appState.audioLevelMeter
         do {
             try audioRecorder.start(
-                onLevel: { [appState] (level: Float) in
-                    Task { @MainActor in
-                        appState.audioLevel = level
-                    }
+                onLevel: { (level: Float) in
+                    audioLevelMeter.level = level
                 },
                 onInputConfigurationChange: {
                     handleInputConfigurationChange()
@@ -273,7 +272,7 @@ struct WhisperApp: App {
             startRecordingTimeout()
         } catch {
             cancelRecordingTimeout()
-            appState.audioLevel = 0
+            appState.audioLevelMeter.level = 0
             _ = appState.transition(to: .error(error.localizedDescription))
             overlayManager.hide()
             resetAfterDelay()
@@ -354,7 +353,7 @@ struct WhisperApp: App {
         cancelRecordingTimeout()
         cancelInputRecovery()
         audioRecorder.stopDiscarding()
-        appState.audioLevel = 0
+        appState.audioLevelMeter.level = 0
         overlayManager.hide()
         _ = appState.transition(to: .error("Audio input changed. Try again."))
         resetAfterDelay(seconds: 2)
@@ -376,7 +375,7 @@ struct WhisperApp: App {
         cancelInputRecovery()
 
         let segments = audioRecorder.stopCapturingSegments()
-        appState.audioLevel = 0
+        appState.audioLevelMeter.level = 0
 
         let rawDuration = segments.reduce(0.0) { partial, segment in
             guard segment.sampleRate > 0 else { return partial }
