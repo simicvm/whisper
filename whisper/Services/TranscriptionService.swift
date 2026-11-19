@@ -22,7 +22,9 @@ actor TranscriptionService {
     private var loadGeneration: UInt64 = 0
 
     private var hasActiveOperation = false
-    private var waitingOperations: [CheckedContinuation<Void, Never>] = []
+    private var waitingOperations: [(id: UUID, continuation: CheckedContinuation<Void, Error>)] = []
+    private var warmupTask: Task<Void, Never>?
+    private static let maxConcurrentDownloads = 4
     private static let cacheInspectionQueue = DispatchQueue(
         label: "shoki.whisper.transcription.cache-inspection",
         qos: .utility
@@ -37,6 +39,10 @@ actor TranscriptionService {
         let model: any STTGenerationModel
         let parameters: STTGenerateParameters
         let audio: [Float]
+    }
+
+    private struct LoadedModelBox: @unchecked Sendable {
+        let model: any STTGenerationModel
     }
 
     /// Whether a model is currently loaded and ready.
@@ -68,7 +74,7 @@ actor TranscriptionService {
     /// that may have been created by older download paths.
     func deleteLocalModel(repoID: String) async throws {
         try Task.checkCancellation()
-        await acquireOperationTurn()
+        try await acquireOperationTurn()
         defer { releaseOperationTurn() }
         try Task.checkCancellation()
 
@@ -88,7 +94,7 @@ actor TranscriptionService {
         updateHandler: (@MainActor @Sendable (ModelLoadUpdate) -> Void)? = nil
     ) async throws {
         try Task.checkCancellation()
-        await acquireOperationTurn()
+        try await acquireOperationTurn()
         defer { releaseOperationTurn() }
         try Task.checkCancellation()
 
@@ -118,7 +124,7 @@ actor TranscriptionService {
 
         await updateHandler?(.initializing)
 
-        let loaded = try await Self.loadPretrainedModel(for: definition)
+        let loaded = try await loadPretrainedModel(for: definition)
 
         try Task.checkCancellation()
         guard generation == loadGeneration else {
@@ -128,19 +134,94 @@ actor TranscriptionService {
         model = loaded
         currentFamily = definition.family
         currentRepoID = repoID
+        scheduleShaderWarmup(generation: generation)
     }
 
-    private static func loadPretrainedModel(
+    private func loadPretrainedModel(
         for definition: STTModelDefinition
     ) async throws -> any STTGenerationModel {
+        let modelDir = Self.modelDirectory(for: definition.repoID)
+        let hasLocalSnapshot = await Self.hasCompleteModelSnapshot(
+            at: modelDir,
+            family: definition.family
+        )
+
         switch definition.family {
         case .qwen3:
+            if hasLocalSnapshot {
+                return try await Qwen3ASRModel.fromModelDirectory(modelDir)
+            }
             return try await Qwen3ASRModel.fromPretrained(definition.repoID)
         case .nemotron:
+            if hasLocalSnapshot {
+                return try await loadOnInferenceQueue {
+                    try NemotronASRModel.fromDirectory(modelDir)
+                }
+            }
             return try await NemotronASRModel.fromPretrained(definition.repoID)
         case .parakeet:
+            if hasLocalSnapshot {
+                return try await loadOnInferenceQueue {
+                    try ParakeetModel.fromDirectory(modelDir)
+                }
+            }
             return try await ParakeetModel.fromPretrained(definition.repoID)
         }
+    }
+
+    /// Runs synchronous model deserialisation and weight `eval` on `inferenceQueue`
+    /// so heavy disk/Metal work does not block Swift's cooperative thread pool.
+    private func loadOnInferenceQueue(
+        _ loader: @escaping @Sendable () throws -> any STTGenerationModel
+    ) async throws -> any STTGenerationModel {
+        let box: LoadedModelBox = try await withCheckedThrowingContinuation { continuation in
+            inferenceQueue.async {
+                do {
+                    let loaded = try loader()
+                    continuation.resume(returning: LoadedModelBox(model: loaded))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+        return box.model
+    }
+
+    /// Pre-compiles Metal inference pipelines with a tiny silent clip right
+    /// after model load so the very first dictation does not pay shader
+    /// compilation latency.
+    private func scheduleShaderWarmup(generation: UInt64) {
+        warmupTask?.cancel()
+        warmupTask = Task(priority: .utility) {
+            await performShaderWarmup(generation: generation)
+        }
+    }
+
+    private func performShaderWarmup(generation: UInt64) async {
+        do {
+            try await acquireOperationTurn()
+        } catch {
+            return
+        }
+        defer { releaseOperationTurn() }
+
+        guard !Task.isCancelled,
+              generation == loadGeneration,
+              let model,
+              let currentFamily else {
+            return
+        }
+
+        let warmupSamples = [Float](repeating: 0, count: max(1, model.sampleRate / 4))
+        let parameters: STTGenerateParameters
+        switch currentFamily {
+        case .qwen3:
+            parameters = STTGenerateParameters(maxTokens: 1, language: "English")
+        case .nemotron, .parakeet:
+            parameters = STTGenerateParameters(language: "en")
+        }
+
+        _ = await runInference(model: model, parameters: parameters, audio: warmupSamples)
     }
 
     internal static func qwen3MaxTokens(
@@ -301,48 +382,80 @@ actor TranscriptionService {
 
         let totalBytes = max(files.reduce(Int64(0)) { $0 + $1.weight }, 1)
         let progressThrottle = DownloadProgressThrottle()
-        var completedBytes = files.reduce(Int64(0)) { partial, file in
-            partial + (isCompleteLocalFile(file) ? file.weight : 0)
-        }
+        let initialCompleted = files.map { isCompleteLocalFile($0) ? $0.weight : Int64(0) }
+        let progressAccumulator = DownloadProgressAccumulator(initialBytes: initialCompleted)
         reportModelDownloadProgress(
-            completedBytes: completedBytes,
+            completedBytes: progressAccumulator.totalCompleted(),
             totalBytes: totalBytes,
             throttle: progressThrottle,
             updateHandler: updateHandler
         )
 
         let bearerToken = await client.bearerToken
+        let userAgent = client.userAgent
+        let host = client.host
+        let pendingIndices = files.indices.filter { !isCompleteLocalFile(files[$0]) }
 
-        for file in files where !isCompleteLocalFile(file) {
-            try Task.checkCancellation()
-            let completedBeforeFile = completedBytes
-            var request = URLRequest(url: downloadURL(for: file.entry.path, repo: repo, host: client.host))
-            request.httpMethod = "GET"
-            request.cachePolicy = .reloadIgnoringLocalCacheData
-            if let userAgent = client.userAgent {
-                request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
-            }
-            if let bearerToken {
-                request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
-            }
+        if !pendingIndices.isEmpty {
+            let downloadSession = SharedModelDownloader()
+            defer { downloadSession.finishAndInvalidate() }
 
-            try await ModelFileDownloader.download(request: request, to: file.destination) { downloadedBytes, _ in
-                let currentBytes = min(max(downloadedBytes, 0), file.weight)
-                reportModelDownloadProgress(
-                    completedBytes: completedBeforeFile + currentBytes,
-                    totalBytes: totalBytes,
-                    throttle: progressThrottle,
-                    updateHandler: updateHandler
-                )
-            }
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                var nextPending = 0
 
-            completedBytes += file.weight
-            reportModelDownloadProgress(
-                completedBytes: completedBytes,
-                totalBytes: totalBytes,
-                throttle: progressThrottle,
-                updateHandler: updateHandler
-            )
+                func enqueueNext() {
+                    guard nextPending < pendingIndices.count else { return }
+                    let fileIndex = pendingIndices[nextPending]
+                    nextPending += 1
+                    let file = files[fileIndex]
+
+                    group.addTask {
+                        try Task.checkCancellation()
+                        var request = URLRequest(url: downloadURL(for: file.entry.path, repo: repo, host: host))
+                        request.httpMethod = "GET"
+                        request.cachePolicy = .reloadIgnoringLocalCacheData
+                        if let userAgent {
+                            request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+                        }
+                        if let bearerToken {
+                            request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
+                        }
+
+                        _ = try await downloadSession.download(request: request, to: file.destination) { downloadedBytes, _ in
+                            let currentBytes = min(max(downloadedBytes, 0), file.weight)
+                            let aggregate = progressAccumulator.update(index: fileIndex, bytes: currentBytes)
+                            reportModelDownloadProgress(
+                                completedBytes: aggregate,
+                                totalBytes: totalBytes,
+                                throttle: progressThrottle,
+                                updateHandler: updateHandler
+                            )
+                        }
+
+                        let aggregate = progressAccumulator.update(index: fileIndex, bytes: file.weight)
+                        reportModelDownloadProgress(
+                            completedBytes: aggregate,
+                            totalBytes: totalBytes,
+                            throttle: progressThrottle,
+                            updateHandler: updateHandler
+                        )
+                    }
+                }
+
+                let initialBatch = min(maxConcurrentDownloads, pendingIndices.count)
+                for _ in 0..<initialBatch {
+                    enqueueNext()
+                }
+
+                do {
+                    while try await group.next() != nil {
+                        enqueueNext()
+                    }
+                } catch {
+                    group.cancelAll()
+                    throw error
+                }
+            }
         }
 
         // Record the full set of expected files and sizes atomically once all
@@ -515,7 +628,7 @@ actor TranscriptionService {
     /// - Returns: Transcribed text string.
     func transcribe(audio: [Float]) async throws -> String {
         try Task.checkCancellation()
-        await acquireOperationTurn()
+        try await acquireOperationTurn()
         defer { releaseOperationTurn() }
         try Task.checkCancellation()
 
@@ -552,21 +665,39 @@ actor TranscriptionService {
 
     private func invalidateLoadedModel() {
         loadGeneration &+= 1
+        warmupTask?.cancel()
+        warmupTask = nil
         model = nil
         currentFamily = nil
         currentRepoID = nil
         Memory.clearCache()
     }
 
-    private func acquireOperationTurn() async {
+    private func acquireOperationTurn() async throws {
+        try Task.checkCancellation()
         if !hasActiveOperation {
             hasActiveOperation = true
             return
         }
 
-        await withCheckedContinuation { continuation in
-            waitingOperations.append(continuation)
+        let waiterID = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                waitingOperations.append((id: waiterID, continuation: continuation))
+            }
+        } onCancel: {
+            Task { await self.cancelWaitingOperation(id: waiterID) }
         }
+    }
+
+    private func cancelWaitingOperation(id: UUID) {
+        guard let index = waitingOperations.firstIndex(where: { $0.id == id }) else { return }
+        let removed = waitingOperations.remove(at: index)
+        removed.continuation.resume(throwing: CancellationError())
     }
 
     private func releaseOperationTurn() {
@@ -576,7 +707,7 @@ actor TranscriptionService {
         }
 
         let next = waitingOperations.removeFirst()
-        next.resume()
+        next.continuation.resume()
     }
 
     private func runInference(
@@ -660,78 +791,82 @@ private struct ModelDownloadFile: Sendable {
     }
 }
 
-private final class ModelFileDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
-    private let destination: URL
-    private let progressHandler: @Sendable (Int64, Int64) -> Void
-    private let lock = NSLock()
-    private var continuation: CheckedContinuation<URL, Error>?
-    private var task: URLSessionDownloadTask?
-    private var session: URLSession?
-    private var finished = false
-    private var cancelled = false
+/// Reuses a single `URLSession` across concurrent file downloads for a model
+/// snapshot so HTTP/2 connections and TLS sessions are shared.
+private final class SharedModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+    private final class ActiveDownload {
+        let destination: URL
+        let progressHandler: @Sendable (Int64, Int64) -> Void
+        var continuation: CheckedContinuation<URL, Error>?
+        var task: URLSessionDownloadTask?
+        var finished = false
+        var cancelled = false
 
-    private init(
-        destination: URL,
-        progressHandler: @escaping @Sendable (Int64, Int64) -> Void
-    ) {
-        self.destination = destination
-        self.progressHandler = progressHandler
+        init(destination: URL, progressHandler: @escaping @Sendable (Int64, Int64) -> Void) {
+            self.destination = destination
+            self.progressHandler = progressHandler
+        }
     }
 
-    static func download(
+    private let lock = NSLock()
+    private var session: URLSession!
+    private var activeDownloads: [Int: ActiveDownload] = [:]
+
+    override init() {
+        super.init()
+        let config = URLSessionConfiguration.default
+        config.httpMaximumConnectionsPerHost = 4
+        self.session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+    }
+
+    func finishAndInvalidate() {
+        session.finishTasksAndInvalidate()
+    }
+
+    func download(
         request: URLRequest,
         to destination: URL,
         progressHandler: @escaping @Sendable (Int64, Int64) -> Void
     ) async throws -> URL {
-        let downloader = ModelFileDownloader(
-            destination: destination,
-            progressHandler: progressHandler
-        )
+        let entry = ActiveDownload(destination: destination, progressHandler: progressHandler)
+
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                downloader.start(request: request, continuation: continuation)
+                lock.lock()
+                if entry.cancelled {
+                    entry.finished = true
+                    lock.unlock()
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                let task = session.downloadTask(with: request)
+                entry.task = task
+                entry.continuation = continuation
+                activeDownloads[task.taskIdentifier] = entry
+                lock.unlock()
+
+                task.resume()
             }
         } onCancel: {
-            downloader.cancel()
-        }
-    }
-
-    private func start(request: URLRequest, continuation: CheckedContinuation<URL, Error>) {
-        lock.lock()
-        if cancelled {
-            finished = true
+            lock.lock()
+            entry.cancelled = true
+            let task = entry.task
             lock.unlock()
-            continuation.resume(throwing: CancellationError())
-            return
+            task?.cancel()
         }
-
-        let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
-        let task = session.downloadTask(with: request)
-        self.session = session
-        self.task = task
-        self.continuation = continuation
-        lock.unlock()
-
-        task.resume()
-    }
-
-    private func cancel() {
-        lock.lock()
-        cancelled = true
-        let task = task
-        lock.unlock()
-
-        task?.cancel()
     }
 
     func urlSession(
         _: URLSession,
-        downloadTask _: URLSessionDownloadTask,
+        downloadTask: URLSessionDownloadTask,
         didWriteData _: Int64,
         totalBytesWritten: Int64,
         totalBytesExpectedToWrite: Int64
     ) {
-        progressHandler(totalBytesWritten, totalBytesExpectedToWrite)
+        lock.lock()
+        let handler = activeDownloads[downloadTask.taskIdentifier]?.progressHandler
+        lock.unlock()
+        handler?(totalBytesWritten, totalBytesExpectedToWrite)
     }
 
     func urlSession(
@@ -739,13 +874,25 @@ private final class ModelFileDownloader: NSObject, URLSessionDownloadDelegate, @
         downloadTask: URLSessionDownloadTask,
         didFinishDownloadingTo location: URL
     ) {
+        lock.lock()
+        guard let entry = activeDownloads[downloadTask.taskIdentifier] else {
+            lock.unlock()
+            return
+        }
+        let destination = entry.destination
+        lock.unlock()
+
         guard let httpResponse = downloadTask.response as? HTTPURLResponse else {
-            finish(.failure(TranscriptionError.modelDownloadFailed(destination.lastPathComponent, -1)))
+            finish(taskIdentifier: downloadTask.taskIdentifier, result: .failure(
+                TranscriptionError.modelDownloadFailed(destination.lastPathComponent, -1)
+            ))
             return
         }
 
         guard (200 ..< 300).contains(httpResponse.statusCode) else {
-            finish(.failure(TranscriptionError.modelDownloadFailed(destination.lastPathComponent, httpResponse.statusCode)))
+            finish(taskIdentifier: downloadTask.taskIdentifier, result: .failure(
+                TranscriptionError.modelDownloadFailed(destination.lastPathComponent, httpResponse.statusCode)
+            ))
             return
         }
 
@@ -760,42 +907,69 @@ private final class ModelFileDownloader: NSObject, URLSessionDownloadDelegate, @
             } else {
                 try fm.moveItem(at: location, to: destination)
             }
-            finish(.success(destination))
+            finish(taskIdentifier: downloadTask.taskIdentifier, result: .success(destination))
         } catch {
-            finish(.failure(error))
+            finish(taskIdentifier: downloadTask.taskIdentifier, result: .failure(error))
         }
     }
 
     func urlSession(
         _: URLSession,
-        task _: URLSessionTask,
+        task: URLSessionTask,
         didCompleteWithError error: Error?
     ) {
         guard let error else { return }
 
         lock.lock()
-        let wasCancelled = cancelled
+        let wasCancelled = activeDownloads[task.taskIdentifier]?.cancelled ?? false
         lock.unlock()
 
-        finish(.failure(wasCancelled ? CancellationError() : error))
+        finish(
+            taskIdentifier: task.taskIdentifier,
+            result: .failure(wasCancelled ? CancellationError() : error)
+        )
     }
 
-    private func finish(_ result: Result<URL, Error>) {
+    private func finish(taskIdentifier: Int, result: Result<URL, Error>) {
         lock.lock()
-        guard !finished else {
+        guard let entry = activeDownloads.removeValue(forKey: taskIdentifier), !entry.finished else {
             lock.unlock()
             return
         }
-        finished = true
-        let continuation = continuation
-        let session = session
-        self.continuation = nil
-        self.session = nil
-        task = nil
+        entry.finished = true
+        let continuation = entry.continuation
+        entry.continuation = nil
+        entry.task = nil
         lock.unlock()
 
-        session?.finishTasksAndInvalidate()
         continuation?.resume(with: result)
+    }
+}
+
+/// Thread-safe byte counter across concurrent file downloads.
+private final class DownloadProgressAccumulator: @unchecked Sendable {
+    private let lock = NSLock()
+    private var bytesByIndex: [Int64]
+    private var total: Int64
+
+    init(initialBytes: [Int64]) {
+        self.bytesByIndex = initialBytes
+        self.total = initialBytes.reduce(0, +)
+    }
+
+    func totalCompleted() -> Int64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return total
+    }
+
+    func update(index: Int, bytes: Int64) -> Int64 {
+        lock.lock()
+        defer { lock.unlock() }
+        guard bytesByIndex.indices.contains(index) else { return total }
+        total += bytes - bytesByIndex[index]
+        bytesByIndex[index] = bytes
+        return total
     }
 }
 
