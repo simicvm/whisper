@@ -245,7 +245,7 @@ final class AppState {
         case .pasting:
             return next == .idle
         case .error:
-            return next == .idle || next == .loading
+            return next == .idle || next == .loading || next == .starting
         }
     }
 }

@@ -202,4 +202,13 @@ struct whisperTests {
         #expect(downCount == 1)
     }
 
+    @Test @MainActor
+    func errorPhaseAllowsImmediateRecordingRetry() {
+        let appState = AppState()
+
+        #expect(appState.transition(to: .error("Recording too short.")))
+        #expect(appState.transition(to: .starting))
+        #expect(appState.phase == .starting)
+    }
+
 }

@@ -24,7 +24,8 @@ struct WhisperApp: App {
     @State private var hasLaunched = false
     @State private var recordingTimeoutTask: Task<Void, Never>?
     @State private var hotkeyConfigured = false
-    @State private var accessibilityPollTask: Task<Void, Never>?
+    @State private var accessibilityObserver: NSObjectProtocol?
+    @State private var appActiveObserver: NSObjectProtocol?
     @State private var errorResetTask: Task<Void, Never>?
     @State private var inputRecoveryTask: Task<Void, Never>?
 
@@ -111,10 +112,10 @@ struct WhisperApp: App {
         // ignored by the modelStatus guard in handleKeyDown.
         setupHotkey()
 
-        // If Accessibility isn't granted yet, the tap above failed to install.
-        // Watch for the user granting it in System Settings so the hotkey
-        // starts working without an app relaunch.
-        startAccessibilityPollIfNeeded()
+        // Watch for Accessibility trust changes (via TCC distributed notification
+        // and app activation) so the event tap installs automatically whenever
+        // permission is granted, with zero polling overhead or expiry.
+        observePermissionChanges()
 
         // Discover locally cached models
         await refreshDownloadedModels()
@@ -180,24 +181,33 @@ struct WhisperApp: App {
         hotkeyConfigured = true
     }
 
-    /// Polls Accessibility trust for a few minutes after launch so the event
-    /// tap can be installed as soon as the user grants permission.
+    /// Observes system Accessibility changes and app activation so the global
+    /// hotkey tap can be installed automatically whenever trust is granted,
+    /// without polling or expiring after a fixed timeout.
     @MainActor
-    private func startAccessibilityPollIfNeeded() {
-        guard !appState.hasAccessibilityPermission else { return }
-        guard accessibilityPollTask == nil else { return }
-
-        accessibilityPollTask = Task { @MainActor in
-            defer { accessibilityPollTask = nil }
-            for _ in 0..<180 {
-                do {
-                    try await Task.sleep(for: .seconds(1))
-                } catch {
-                    return
+    private func observePermissionChanges() {
+        if accessibilityObserver == nil {
+            accessibilityObserver = DistributedNotificationCenter.default().addObserver(
+                forName: Notification.Name("com.apple.accessibility.api"),
+                object: nil,
+                queue: .main
+            ) { _ in
+                Task { @MainActor in
+                    // TCC updates trust asynchronously right after posting the notification.
+                    try? await Task.sleep(for: .milliseconds(150))
+                    refreshPermissionState()
                 }
-                refreshPermissionState()
-                if appState.hasAccessibilityPermission {
-                    return
+            }
+        }
+
+        if appActiveObserver == nil {
+            appActiveObserver = NotificationCenter.default.addObserver(
+                forName: NSApplication.didBecomeActiveNotification,
+                object: nil,
+                queue: .main
+            ) { _ in
+                Task { @MainActor in
+                    refreshPermissionState()
                 }
             }
         }
@@ -223,7 +233,14 @@ struct WhisperApp: App {
         refreshPermissionState()
 
         guard !appState.isEditingHotkey else { return }
-        guard appState.phase == .idle else { return }
+        let canStartFromCurrentPhase: Bool
+        switch appState.phase {
+        case .idle, .error:
+            canStartFromCurrentPhase = true
+        default:
+            canStartFromCurrentPhase = false
+        }
+        guard canStartFromCurrentPhase else { return }
         guard appState.modelStatus == .loaded else { return }
 
         guard appState.hasRequiredPermissions else {
@@ -234,6 +251,9 @@ struct WhisperApp: App {
             return
         }
 
+        errorResetTask?.cancel()
+        errorResetTask = nil
+        cancelInputRecovery()
         _ = appState.transition(to: .starting)
 
         do {
@@ -324,8 +344,15 @@ struct WhisperApp: App {
     }
 
     @MainActor
+    private func cancelInputRecovery() {
+        inputRecoveryTask?.cancel()
+        inputRecoveryTask = nil
+    }
+
+    @MainActor
     private func abortRecordingAfterInputChange() {
         cancelRecordingTimeout()
+        cancelInputRecovery()
         audioRecorder.stopDiscarding()
         appState.audioLevel = 0
         overlayManager.hide()
@@ -346,6 +373,7 @@ struct WhisperApp: App {
         if cancelTimeoutTask {
             cancelRecordingTimeout()
         }
+        cancelInputRecovery()
 
         let segments = audioRecorder.stopCapturingSegments()
         appState.audioLevel = 0
@@ -470,7 +498,9 @@ struct WhisperApp: App {
         let repoID = model.repoID
 
         if appState.selectedModelID == repoID {
+            modelLoadGeneration &+= 1
             modelLoadTask?.cancel()
+            modelLoadTask = nil
         }
 
         do {
@@ -517,6 +547,7 @@ struct WhisperApp: App {
                 }
 
                 await MainActor.run {
+                    guard !Task.isCancelled else { return }
                     guard generation == modelLoadGeneration else { return }
                     guard appState.selectedModelID == repoID else { return }
 
