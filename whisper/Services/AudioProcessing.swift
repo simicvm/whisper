@@ -5,10 +5,10 @@ import Foundation
 ///
 /// These operations improve transcription accuracy and reduce inference time
 /// by removing silence and normalising levels before the audio reaches the model.
-enum AudioProcessing {
+nonisolated enum AudioProcessing {
 
     /// Outcome of voice-activity analysis on a recording.
-    enum SpeechDetectionResult {
+    enum SpeechDetectionResult: Sendable {
         /// Speech was found. The associated audio is trimmed to the active
         /// region (plus pre/post roll) and is safe to gain-normalise.
         case speech([Float])
@@ -70,15 +70,31 @@ enum AudioProcessing {
         // 2. Estimate the noise floor from the lowest-energy windows.
         let noiseFloor = estimateNoiseFloor(energies: energies, config: config)
 
-        // 3. Determine the speech threshold.
-        let threshold = max(
+        // If the quietest 10% of windows are already loud, there is no reliable
+        // silence floor in this clip (either the user spoke continuously from
+        // start to finish, or ambient noise is very high). Pass the audio
+        // through untouched rather than risking slicing off speech or boosting
+        // loud background noise.
+        guard noiseFloor <= config.maxNoiseFloor else {
+            return .indeterminate(samples)
+        }
+
+        // 3. Determine speech detection (high) and boundary (low/hysteresis)
+        // thresholds. Using a lower boundary threshold keeps softer word onsets
+        // and offsets intact once speech is confirmed.
+        let highThreshold = max(
             noiseFloor * config.thresholdMultiplier,
             config.minimumThreshold
         )
+        let lowThreshold = max(
+            noiseFloor * config.boundaryThresholdMultiplier,
+            config.minimumThreshold
+        )
 
-        // 4. Find first and last windows above the threshold.
-        guard let firstActive = energies.firstIndex(where: { $0 > threshold }),
-              let lastActive = energies.lastIndex(where: { $0 > threshold }) else {
+        // 4. Confirm at least one window clears the speech threshold.
+        guard energies.contains(where: { $0 > highThreshold }),
+              let firstActive = energies.firstIndex(where: { $0 > lowThreshold }),
+              let lastActive = energies.lastIndex(where: { $0 > lowThreshold }) else {
             // No window cleared the relative threshold. Reject only when the
             // signal is near-absolute silence; otherwise the recording may be
             // quiet, noisy, or compressed speech the VAD can't certify — for
@@ -132,9 +148,14 @@ enum AudioProcessing {
         guard peak < targetPeak else { return samples }
 
         var scale = targetPeak / peak
-        var result = [Float](repeating: 0, count: samples.count)
-        vDSP_vsmul(samples, 1, &scale, &result, 1, vDSP_Length(samples.count))
-        return result
+        let count = samples.count
+        return [Float](unsafeUninitializedCapacity: count) { buffer, initializedCount in
+            samples.withUnsafeBufferPointer { src in
+                guard let srcBase = src.baseAddress, let dstBase = buffer.baseAddress else { return }
+                vDSP_vsmul(srcBase, 1, &scale, dstBase, 1, vDSP_Length(count))
+            }
+            initializedCount = count
+        }
     }
 
     // MARK: - Internals
@@ -145,8 +166,15 @@ enum AudioProcessing {
         let windowDuration: Double = 0.03  // 30 ms
         /// Hop between consecutive windows in seconds.
         let hopDuration: Double = 0.01     // 10 ms
-        /// Multiplier above the noise floor to set the speech threshold.
+        /// Multiplier above the noise floor to confirm speech is present.
         let thresholdMultiplier: Float = 3.0
+        /// Multiplier above the noise floor used to locate speech boundaries
+        /// once speech is confirmed (hysteresis preserves soft word edges).
+        let boundaryThresholdMultiplier: Float = 1.6
+        /// Maximum RMS that can still represent a silence floor. Above this,
+        /// the clip either has continuous speech with no silence or very loud
+        /// ambient noise, so trimming is skipped.
+        let maxNoiseFloor: Float = 0.025
         /// Absolute minimum RMS threshold — prevents false positives in pure silence.
         let minimumThreshold: Float = 0.005
         /// Window RMS below which the whole recording counts as silent when
@@ -168,23 +196,52 @@ enum AudioProcessing {
         windowSize: Int,
         hopSize: Int
     ) -> [Float] {
-        var energies: [Float] = []
-        energies.reserveCapacity((samples.count - windowSize) / hopSize + 1)
+        let windowCount = (samples.count - windowSize) / hopSize + 1
+        guard windowCount > 0 else { return [] }
 
-        var offset = 0
-        while offset + windowSize <= samples.count {
-            var sumOfSquares: Float = 0
-            // Use vDSP for the dot product (sum of squares).
+        let invWindowSize = 1.0 / Float(windowSize)
+        var meanSquares = [Float](unsafeUninitializedCapacity: windowCount) { buffer, initializedCount in
             samples.withUnsafeBufferPointer { buf in
-                let ptr = buf.baseAddress! + offset
-                vDSP_dotpr(ptr, 1, ptr, 1, &sumOfSquares, vDSP_Length(windowSize))
+                guard let base = buf.baseAddress, let dst = buffer.baseAddress else { return }
+
+                if windowSize % hopSize == 0 {
+                    // Compute non-overlapping hop-sized block energies once and
+                    // combine adjacent blocks per window (3x fewer multiplies).
+                    let blocksPerWindow = windowSize / hopSize
+                    let blockCount = windowCount + blocksPerWindow - 1
+                    var blockSums = [Float](repeating: 0, count: blockCount)
+                    for b in 0..<blockCount {
+                        var sumSq: Float = 0
+                        vDSP_svesq(base + b * hopSize, 1, &sumSq, vDSP_Length(hopSize))
+                        blockSums[b] = sumSq
+                    }
+                    for w in 0..<windowCount {
+                        var sumSq: Float = 0
+                        for k in 0..<blocksPerWindow {
+                            sumSq += blockSums[w + k]
+                        }
+                        dst[w] = sumSq * invWindowSize
+                    }
+                } else {
+                    for w in 0..<windowCount {
+                        var sumSq: Float = 0
+                        vDSP_svesq(base + w * hopSize, 1, &sumSq, vDSP_Length(windowSize))
+                        dst[w] = sumSq * invWindowSize
+                    }
+                }
             }
-            let rms = sqrtf(sumOfSquares / Float(windowSize))
-            energies.append(rms)
-            offset += hopSize
+            initializedCount = windowCount
         }
 
-        return energies
+        var countInt32 = Int32(windowCount)
+        var rms = [Float](unsafeUninitializedCapacity: windowCount) { buffer, initializedCount in
+            meanSquares.withUnsafeBufferPointer { src in
+                guard let srcBase = src.baseAddress, let dstBase = buffer.baseAddress else { return }
+                vvsqrtf(dstBase, srcBase, &countInt32)
+            }
+            initializedCount = windowCount
+        }
+        return rms
     }
 
     /// Estimate the noise floor as the average energy of the quietest windows.
