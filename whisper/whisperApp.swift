@@ -325,11 +325,17 @@ struct WhisperApp: App {
     @MainActor
     private func abortRecordingAfterInputChange() {
         cancelRecordingTimeout()
-        _ = try? audioRecorder.stop()
+        audioRecorder.stopDiscarding()
         appState.audioLevel = 0
         overlayManager.hide()
         _ = appState.transition(to: .error("Audio input changed. Try again."))
         resetAfterDelay(seconds: 2)
+    }
+
+    private enum PreparedAudio: Sendable {
+        case ready([Float])
+        case tooShort
+        case silence
     }
 
     @MainActor
@@ -340,20 +346,14 @@ struct WhisperApp: App {
             cancelRecordingTimeout()
         }
 
-        let rawSamples: [Float]
-        do {
-            rawSamples = try audioRecorder.stop()
-        } catch {
-            appState.audioLevel = 0
-            overlayManager.hide()
-            _ = appState.transition(to: .error(error.localizedDescription))
-            resetAfterDelay()
-            return
-        }
+        let segments = audioRecorder.stopCapturingSegments()
         appState.audioLevel = 0
 
-        let minimumSamples = Int(Self.minimumSpeechDurationSeconds * Self.transcriptionSampleRate)
-        guard rawSamples.count >= minimumSamples else {
+        let rawDuration = segments.reduce(0.0) { partial, segment in
+            guard segment.sampleRate > 0 else { return partial }
+            return partial + Double(segment.samples.count) / segment.sampleRate
+        }
+        guard rawDuration >= Self.minimumSpeechDurationSeconds else {
             overlayManager.hide()
             _ = appState.transition(to: .error("Recording too short. Hold the hotkey briefly and try again."))
             resetAfterDelay(seconds: 2)
@@ -363,35 +363,61 @@ struct WhisperApp: App {
         _ = appState.transition(to: .transcribing)
         overlayManager.show(appState: appState)
 
+        let targetSampleRate = Self.transcriptionSampleRate
+        let minimumSamples = Int(Self.minimumSpeechDurationSeconds * targetSampleRate)
+
         do {
-            // Trim leading/trailing silence before inference. Only confident
-            // near-silence is rejected outright; uncertain audio (quiet,
-            // noisy, or compressed speech the VAD can't certify) goes to the
-            // model unmodified so it can make the final call.
+            // Resample, trim silence, and normalise off the MainActor so the
+            // UI and overlay stay responsive on long recordings.
+            let prepared = try await Task.detached(priority: .userInitiated) { () throws -> PreparedAudio in
+                let rawSamples = try AudioRecorder.finalizeSegments(
+                    segments,
+                    targetSampleRate: targetSampleRate
+                )
+                guard rawSamples.count >= minimumSamples else {
+                    return .tooShort
+                }
+
+                // Trim leading/trailing silence before inference. Only confident
+                // near-silence is rejected outright; uncertain audio (quiet,
+                // noisy, or compressed speech the VAD can't certify) goes to the
+                // model unmodified so it can make the final call.
+                let processed: [Float]
+                switch AudioProcessing.trimSilence(
+                    from: rawSamples,
+                    sampleRate: targetSampleRate
+                ) {
+                case .silence:
+                    return .silence
+                case .speech(let trimmed):
+                    processed = AudioProcessing.normalizeGain(trimmed)
+                case .indeterminate(let audio):
+                    // Deliberately not normalised: boosting what may be pure
+                    // noise to peak level invites hallucinated transcriptions.
+                    processed = audio
+                }
+
+                // The active region may be shorter than the minimum after trimming.
+                guard processed.count >= minimumSamples else {
+                    return .silence
+                }
+                return .ready(processed)
+            }.value
+
             let processed: [Float]
-            switch AudioProcessing.trimSilence(
-                from: rawSamples,
-                sampleRate: Self.transcriptionSampleRate
-            ) {
+            switch prepared {
+            case .tooShort:
+                overlayManager.hide()
+                _ = appState.transition(to: .error("Recording too short. Hold the hotkey briefly and try again."))
+                resetAfterDelay(seconds: 2)
+                return
             case .silence:
                 overlayManager.hide()
                 _ = appState.transition(to: .error("No speech detected. Hold the hotkey, speak, then release."))
                 resetAfterDelay(seconds: 2)
                 return
-            case .speech(let trimmed):
-                processed = AudioProcessing.normalizeGain(trimmed)
-            case .indeterminate(let audio):
-                // Deliberately not normalised: boosting what may be pure
-                // noise to peak level invites hallucinated transcriptions.
+            case .ready(let audio):
                 processed = audio
-            }
-
-            // The active region may be shorter than the minimum after trimming.
-            guard processed.count >= minimumSamples else {
-                overlayManager.hide()
-                _ = appState.transition(to: .error("No speech detected. Hold the hotkey, speak, then release."))
-                resetAfterDelay(seconds: 2)
-                return
             }
 
             let text = try await transcriptionService.transcribe(audio: processed)

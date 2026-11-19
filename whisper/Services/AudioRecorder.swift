@@ -7,6 +7,11 @@ import Foundation
 final class AudioRecorder: @unchecked Sendable {
     static let defaultMaximumDuration: TimeInterval = 90
 
+    struct CapturedSegment: Sendable {
+        let samples: [Float]
+        let sampleRate: Double
+    }
+
     private struct InputFingerprint: Equatable {
         let deviceID: AudioDeviceID
         let nominalSampleRate: Double
@@ -27,10 +32,11 @@ final class AudioRecorder: @unchecked Sendable {
     private var tapInstalled = false
     private var nativeSamples: [Float] = []
     private var nativeSampleRate: Double = 0
-    /// Audio from earlier segments of the current recording, already at the
-    /// target rate. A recording gains a segment each time the engine is
-    /// restarted after the input device reconfigures itself mid-recording.
-    private var completedSamples: [Float] = []
+    /// Audio from earlier segments of the current recording kept at their
+    /// native sample rates so configuration recovery does not resample on the
+    /// main thread. All segments are resampled together off-MainActor on stop.
+    private var completedSegments: [CapturedSegment] = []
+    private var completedDurationSeconds: Double = 0
     /// Identifies the live tap so a late buffer from a replaced engine can't
     /// be appended to a segment recorded at a different sample rate.
     private var segmentID: UInt64 = 0
@@ -77,7 +83,8 @@ final class AudioRecorder: @unchecked Sendable {
         }
 
         lock.lock()
-        completedSamples.removeAll()
+        completedSegments.removeAll()
+        completedDurationSeconds = 0
         nativeSamples.removeAll()
         isRecording = true
         reachedSampleLimit = false
@@ -128,24 +135,17 @@ final class AudioRecorder: @unchecked Sendable {
         guard let currentInput = try? Self.currentInputFingerprint() else { return .retry }
         guard currentInput.deviceID == recordingDeviceID else { return .failed }
 
-        // Seal the segment captured at the old sample rate.
+        // Seal the segment captured at the old sample rate (resampling happens
+        // off the main thread once recording stops).
         lock.lock()
         let segment = nativeSamples
         let segmentRate = nativeSampleRate
         nativeSamples.removeAll()
+        if !segment.isEmpty, segmentRate > 0 {
+            completedSegments.append(CapturedSegment(samples: segment, sampleRate: segmentRate))
+            completedDurationSeconds += Double(segment.count) / segmentRate
+        }
         lock.unlock()
-
-        let converted: [Float]
-        do {
-            converted = try Self.convertToTargetRate(segment, from: segmentRate, to: targetSampleRate)
-        } catch {
-            return .failed
-        }
-        if !converted.isEmpty {
-            lock.lock()
-            completedSamples.append(contentsOf: converted)
-            lock.unlock()
-        }
 
         removeTapIfInstalled()
         replaceEngine()
@@ -174,10 +174,7 @@ final class AudioRecorder: @unchecked Sendable {
         segmentID &+= 1
         let segment = segmentID
         nativeSampleRate = nativeFormat.sampleRate
-        let remainingDuration = max(
-            0,
-            maximumDuration - Double(completedSamples.count) / targetSampleRate
-        )
+        let remainingDuration = max(0, maximumDuration - completedDurationSeconds)
         // Reserve enough for a typical dictation up front so the audio-thread
         // tap doesn't repeatedly reallocate-and-copy while appending (a 90s
         // recording at 48kHz grows to ~4.3M floats). Longer recordings still
@@ -289,15 +286,18 @@ final class AudioRecorder: @unchecked Sendable {
         return true
     }
 
-    /// Stop recording and return the captured audio samples resampled to 16kHz mono float32.
-    func stop() throws -> [Float] {
+    /// Stop recording immediately and return the raw captured segments without
+    /// resampling on the calling thread. Call `finalizeSegments(_:)` off the
+    /// main thread to produce 16 kHz mono Float32 audio.
+    func stopCapturingSegments() -> [CapturedSegment] {
         lock.lock()
         isRecording = false
         reachedSampleLimit = false
-        let earlier = completedSamples
+        var segments = completedSegments
         let captured = nativeSamples
         let capturedRate = nativeSampleRate
-        completedSamples.removeAll()
+        completedSegments.removeAll()
+        completedDurationSeconds = 0
         nativeSamples.removeAll()
         onLevel = nil
         onInputConfigurationChange = nil
@@ -308,9 +308,53 @@ final class AudioRecorder: @unchecked Sendable {
         removeTapIfInstalled()
         engine.stop()
 
-        // Earlier segments are already at 16kHz; convert the live one.
-        let latest = try Self.convertToTargetRate(captured, from: capturedRate, to: targetSampleRate)
-        return earlier + latest
+        if !captured.isEmpty, capturedRate > 0 {
+            segments.append(CapturedSegment(samples: captured, sampleRate: capturedRate))
+        }
+        return segments
+    }
+
+    /// Stop recording and discard any captured audio.
+    func stopDiscarding() {
+        _ = stopCapturingSegments()
+    }
+
+    /// Stop recording and return the captured audio samples resampled to 16kHz mono float32.
+    func stop() throws -> [Float] {
+        try Self.finalizeSegments(stopCapturingSegments(), targetSampleRate: targetSampleRate)
+    }
+
+    /// Resamples and concatenates captured segments into 16 kHz mono Float32 samples.
+    /// Safe to invoke from any background thread.
+    static func finalizeSegments(
+        _ segments: [CapturedSegment],
+        targetSampleRate: Double = 16_000
+    ) throws -> [Float] {
+        guard !segments.isEmpty else { return [] }
+        if segments.count == 1 {
+            return try convertToTargetRate(
+                segments[0].samples,
+                from: segments[0].sampleRate,
+                to: targetSampleRate
+            )
+        }
+
+        var combined: [Float] = []
+        let estimatedCount = segments.reduce(0) { partial, segment in
+            guard segment.sampleRate > 0 else { return partial }
+            return partial + Int(ceil(Double(segment.samples.count) * (targetSampleRate / segment.sampleRate)))
+        }
+        combined.reserveCapacity(estimatedCount + 64)
+
+        for segment in segments {
+            let converted = try convertToTargetRate(
+                segment.samples,
+                from: segment.sampleRate,
+                to: targetSampleRate
+            )
+            combined.append(contentsOf: converted)
+        }
+        return combined
     }
 
     private func shouldReplaceEngine(for currentInput: InputFingerprint) -> Bool {
@@ -343,7 +387,8 @@ final class AudioRecorder: @unchecked Sendable {
         lock.lock()
         isRecording = false
         reachedSampleLimit = false
-        completedSamples.removeAll()
+        completedSegments.removeAll()
+        completedDurationSeconds = 0
         nativeSamples.removeAll()
         onLevel = nil
         onInputConfigurationChange = nil
