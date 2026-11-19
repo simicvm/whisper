@@ -184,41 +184,44 @@ final class AudioRecorder: @unchecked Sendable {
 
         let segmentSampleLimit = Int(nativeFormat.sampleRate * remainingDuration)
 
-        // Tap in the native format — no conversion during recording
+        // Reusable scratch buffer confined to the serial tap callback thread so
+        // multi-channel or non-float32 downmixing does not allocate per buffer.
+        var tapScratch: [Float] = []
+
+        // Tap in the native format — no sample-rate conversion during recording
         inputNode.installTap(onBus: 0, bufferSize: 4096, format: nativeFormat) { [weak self] buffer, _ in
             guard let self else { return }
-            guard let channelData = buffer.floatChannelData else { return }
-            let count = Int(buffer.frameLength)
-            guard count > 0 else { return }
 
-            // Take first channel only
-            let bufferPointer = UnsafeBufferPointer(start: channelData[0], count: count)
+            Self.withMonoSamples(from: buffer, scratch: &tapScratch) { bufferPointer in
+                let count = bufferPointer.count
+                guard count > 0, let baseAddress = bufferPointer.baseAddress else { return }
 
-            // Compute RMS level (vectorised; this runs on the audio tap thread)
-            if let onLevel = capturedOnLevel {
-                var rms: Float = 0
-                vDSP_rmsqv(bufferPointer.baseAddress!, 1, &rms, vDSP_Length(count))
-                // Normalize: typical speech RMS is ~0.01–0.1, clamp and scale to 0–1
-                let normalized = min(rms * 5.0, 1.0)
-                onLevel(normalized)
-            }
+                // Compute RMS level (vectorised; this runs on the audio tap thread)
+                if let onLevel = capturedOnLevel {
+                    var rms: Float = 0
+                    vDSP_rmsqv(baseAddress, 1, &rms, vDSP_Length(count))
+                    // Normalize: typical speech RMS is ~0.01–0.1, clamp and scale to 0–1
+                    let normalized = min(rms * 5.0, 1.0)
+                    onLevel(normalized)
+                }
 
-            self.lock.lock()
-            if self.isRecording, self.segmentID == segment {
-                let remaining = segmentSampleLimit - self.nativeSamples.count
+                self.lock.lock()
+                if self.isRecording, self.segmentID == segment {
+                    let remaining = segmentSampleLimit - self.nativeSamples.count
 
-                if remaining > 0 {
-                    if count <= remaining {
-                        self.nativeSamples.append(contentsOf: bufferPointer)
+                    if remaining > 0 {
+                        if count <= remaining {
+                            self.nativeSamples.append(contentsOf: bufferPointer)
+                        } else {
+                            self.nativeSamples.append(contentsOf: bufferPointer.prefix(remaining))
+                            self.isRecording = false
+                        }
                     } else {
-                        self.nativeSamples.append(contentsOf: bufferPointer.prefix(remaining))
                         self.isRecording = false
                     }
-                } else {
-                    self.isRecording = false
                 }
+                self.lock.unlock()
             }
-            self.lock.unlock()
         }
         tapInstalled = true
 
@@ -492,6 +495,181 @@ final class AudioRecorder: @unchecked Sendable {
             nominalSampleRate: nominalSampleRate,
             channelCount: channelCount
         )
+    }
+
+    /// Extracts mono Float32 samples from any supported PCM buffer layout
+    /// (mono/multi-channel, interleaved/non-interleaved, float32/int16/int32).
+    /// Active channels are averaged so mics plugged into non-zero inputs on
+    /// multi-channel audio interfaces are captured at full level.
+    static func withMonoSamples(
+        from buffer: AVAudioPCMBuffer,
+        scratch: inout [Float],
+        _ body: (UnsafeBufferPointer<Float>) -> Void
+    ) {
+        let frameCount = Int(buffer.frameLength)
+        let channelCount = Int(buffer.format.channelCount)
+        guard frameCount > 0, channelCount > 0 else { return }
+
+        let isInterleaved = buffer.format.isInterleaved
+
+        // Fast path: non-interleaved Float32
+        if let floatChannels = buffer.floatChannelData {
+            if !isInterleaved {
+                if channelCount == 1 {
+                    body(UnsafeBufferPointer(start: floatChannels[0], count: frameCount))
+                    return
+                }
+
+                // Measure per-channel RMS so silent/unplugged inputs don't dilute the active mic.
+                var channelRMS = [Float](repeating: 0, count: channelCount)
+                var maxRMS: Float = 0
+                for ch in 0..<channelCount {
+                    var rms: Float = 0
+                    vDSP_rmsqv(floatChannels[ch], 1, &rms, vDSP_Length(frameCount))
+                    channelRMS[ch] = rms
+                    if rms > maxRMS { maxRMS = rms }
+                }
+
+                let activeThreshold = max(maxRMS * 0.05, 1e-6)
+                var activeChannels: [Int] = []
+                activeChannels.reserveCapacity(channelCount)
+                for ch in 0..<channelCount where channelRMS[ch] >= activeThreshold {
+                    activeChannels.append(ch)
+                }
+
+                if activeChannels.isEmpty {
+                    body(UnsafeBufferPointer(start: floatChannels[0], count: frameCount))
+                    return
+                }
+                if activeChannels.count == 1 {
+                    body(UnsafeBufferPointer(start: floatChannels[activeChannels[0]], count: frameCount))
+                    return
+                }
+
+                ensureScratchCapacity(&scratch, count: frameCount)
+                scratch.withUnsafeMutableBufferPointer { dst in
+                    guard let dstBase = dst.baseAddress else { return }
+                    dstBase.update(from: floatChannels[activeChannels[0]], count: frameCount)
+                    for ch in activeChannels.dropFirst() {
+                        vDSP_vadd(dstBase, 1, floatChannels[ch], 1, dstBase, 1, vDSP_Length(frameCount))
+                    }
+                    var invCount = 1.0 / Float(activeChannels.count)
+                    vDSP_vsmul(dstBase, 1, &invCount, dstBase, 1, vDSP_Length(frameCount))
+                    body(UnsafeBufferPointer(start: dstBase, count: frameCount))
+                }
+                return
+            }
+
+            // Interleaved Float32
+            let base = floatChannels[0]
+            let stride = vDSP_Stride(channelCount)
+            var channelRMS = [Float](repeating: 0, count: channelCount)
+            var maxRMS: Float = 0
+            for ch in 0..<channelCount {
+                var rms: Float = 0
+                vDSP_rmsqv(base + ch, stride, &rms, vDSP_Length(frameCount))
+                channelRMS[ch] = rms
+                if rms > maxRMS { maxRMS = rms }
+            }
+            let activeThreshold = max(maxRMS * 0.05, 1e-6)
+            var activeChannels = (0..<channelCount).filter { channelRMS[$0] >= activeThreshold }
+            if activeChannels.isEmpty { activeChannels = [0] }
+
+            ensureScratchCapacity(&scratch, count: frameCount)
+            scratch.withUnsafeMutableBufferPointer { dst in
+                guard let dstBase = dst.baseAddress else { return }
+                var zero: Float = 0
+                vDSP_vfill(&zero, dstBase, 1, vDSP_Length(frameCount))
+                for ch in activeChannels {
+                    vDSP_vadd(dstBase, 1, base + ch, stride, dstBase, 1, vDSP_Length(frameCount))
+                }
+                if activeChannels.count > 1 {
+                    var invCount = 1.0 / Float(activeChannels.count)
+                    vDSP_vsmul(dstBase, 1, &invCount, dstBase, 1, vDSP_Length(frameCount))
+                }
+                body(UnsafeBufferPointer(start: dstBase, count: frameCount))
+            }
+            return
+        }
+
+        // Int16 PCM (non-interleaved or interleaved)
+        if let int16Channels = buffer.int16ChannelData {
+            var scale: Float = 1.0 / 32768.0
+            extractIntegerChannels(
+                frameCount: frameCount,
+                channelCount: channelCount,
+                isInterleaved: isInterleaved,
+                scratch: &scratch,
+                convertChannel: { ch, dst in
+                    let src = isInterleaved ? int16Channels[0] + ch : int16Channels[ch]
+                    let stride: vDSP_Stride = isInterleaved ? vDSP_Stride(channelCount) : 1
+                    vDSP_vflt16(src, stride, dst, 1, vDSP_Length(frameCount))
+                    vDSP_vsmul(dst, 1, &scale, dst, 1, vDSP_Length(frameCount))
+                },
+                body: body
+            )
+            return
+        }
+
+        // Int32 PCM (non-interleaved or interleaved)
+        if let int32Channels = buffer.int32ChannelData {
+            var scale: Float = 1.0 / 2_147_483_648.0
+            extractIntegerChannels(
+                frameCount: frameCount,
+                channelCount: channelCount,
+                isInterleaved: isInterleaved,
+                scratch: &scratch,
+                convertChannel: { ch, dst in
+                    let src = isInterleaved ? int32Channels[0] + ch : int32Channels[ch]
+                    let stride: vDSP_Stride = isInterleaved ? vDSP_Stride(channelCount) : 1
+                    vDSP_vflt32(src, stride, dst, 1, vDSP_Length(frameCount))
+                    vDSP_vsmul(dst, 1, &scale, dst, 1, vDSP_Length(frameCount))
+                },
+                body: body
+            )
+        }
+    }
+
+    private static func extractIntegerChannels(
+        frameCount: Int,
+        channelCount: Int,
+        isInterleaved: Bool,
+        scratch: inout [Float],
+        convertChannel: (Int, UnsafeMutablePointer<Float>) -> Void,
+        body: (UnsafeBufferPointer<Float>) -> Void
+    ) {
+        _ = isInterleaved
+        // Allocate space for accumulation + single-channel temp buffer.
+        ensureScratchCapacity(&scratch, count: frameCount * 2)
+        scratch.withUnsafeMutableBufferPointer { buf in
+            guard let base = buf.baseAddress else { return }
+            let acc = base
+            let tmp = base + frameCount
+            var zero: Float = 0
+            vDSP_vfill(&zero, acc, 1, vDSP_Length(frameCount))
+
+            var activeCount = 0
+            for ch in 0..<channelCount {
+                convertChannel(ch, tmp)
+                var rms: Float = 0
+                vDSP_rmsqv(tmp, 1, &rms, vDSP_Length(frameCount))
+                if rms >= 1e-6 || channelCount == 1 {
+                    vDSP_vadd(acc, 1, tmp, 1, acc, 1, vDSP_Length(frameCount))
+                    activeCount += 1
+                }
+            }
+            if activeCount > 1 {
+                var invCount = 1.0 / Float(activeCount)
+                vDSP_vsmul(acc, 1, &invCount, acc, 1, vDSP_Length(frameCount))
+            }
+            body(UnsafeBufferPointer(start: acc, count: frameCount))
+        }
+    }
+
+    private static func ensureScratchCapacity(_ scratch: inout [Float], count: Int) {
+        if scratch.count < count {
+            scratch = [Float](repeating: 0, count: count)
+        }
     }
 
     /// Resample audio offline using AVAudioConverter (not in a real-time callback).

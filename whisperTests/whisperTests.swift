@@ -5,6 +5,7 @@
 //  Created by Marko Simic on 13-02-2026.
 //
 
+import AVFoundation
 import Foundation
 import Testing
 @testable import whisper
@@ -107,6 +108,73 @@ struct whisperTests {
         #expect(throws: AudioRecorderError.self) {
             _ = try AudioRecorder.resample([0.1, 0.2], from: 0, to: 16_000)
         }
+    }
+
+    @Test
+    func extractsMonoFromMultiChannelInterleavedAndInt16Buffers() throws {
+        var scratch: [Float] = []
+
+        // 1. Two-channel non-interleaved Float32 with mic only on channel 2 (index 1).
+        let stereoFormat = try #require(AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 48_000,
+            channels: 2,
+            interleaved: false
+        ))
+        let stereoBuffer = try #require(AVAudioPCMBuffer(pcmFormat: stereoFormat, frameCapacity: 4))
+        stereoBuffer.frameLength = 4
+        let ch0 = stereoBuffer.floatChannelData![0]
+        let ch1 = stereoBuffer.floatChannelData![1]
+        for i in 0..<4 {
+            ch0[i] = 0
+            ch1[i] = 0.5
+        }
+        var extracted: [Float] = []
+        AudioRecorder.withMonoSamples(from: stereoBuffer, scratch: &scratch) { ptr in
+            extracted = Array(ptr)
+        }
+        #expect(extracted.count == 4)
+        #expect(extracted.allSatisfy { abs($0 - 0.5) < 1e-5 })
+
+        // 2. Two-channel interleaved Float32 with both channels active.
+        let interleavedFormat = try #require(AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 48_000,
+            channels: 2,
+            interleaved: true
+        ))
+        let interleavedBuffer = try #require(AVAudioPCMBuffer(pcmFormat: interleavedFormat, frameCapacity: 3))
+        interleavedBuffer.frameLength = 3
+        let interleavedPtr = interleavedBuffer.floatChannelData![0]
+        let rawInterleaved: [Float] = [0.2, 0.6, 0.4, 0.8, -0.2, 0.2]
+        for i in 0..<rawInterleaved.count {
+            interleavedPtr[i] = rawInterleaved[i]
+        }
+        AudioRecorder.withMonoSamples(from: interleavedBuffer, scratch: &scratch) { ptr in
+            extracted = Array(ptr)
+        }
+        #expect(extracted.count == 3)
+        #expect(abs(extracted[0] - 0.4) < 1e-5)
+        #expect(abs(extracted[1] - 0.6) < 1e-5)
+        #expect(abs(extracted[2] - 0.0) < 1e-5)
+
+        // 3. Mono Int16 buffer.
+        let int16Format = try #require(AVAudioFormat(
+            commonFormat: .pcmFormatInt16,
+            sampleRate: 16_000,
+            channels: 1,
+            interleaved: false
+        ))
+        let int16Buffer = try #require(AVAudioPCMBuffer(pcmFormat: int16Format, frameCapacity: 2))
+        int16Buffer.frameLength = 2
+        int16Buffer.int16ChannelData![0][0] = 16_384
+        int16Buffer.int16ChannelData![0][1] = -16_384
+        AudioRecorder.withMonoSamples(from: int16Buffer, scratch: &scratch) { ptr in
+            extracted = Array(ptr)
+        }
+        #expect(extracted.count == 2)
+        #expect(abs(extracted[0] - 0.5) < 1e-4)
+        #expect(abs(extracted[1] - (-0.5)) < 1e-4)
     }
 
 }
