@@ -1,28 +1,62 @@
 import Foundation
 
 /// Model families supported by the transcription engine. The family decides
-/// which MLXAudioSTT class loads the checkpoint and which repository files
+/// which inference backend loads the checkpoint and which repository files
 /// make up a complete local snapshot.
 enum STTModelFamily {
     case qwen3
     case nemotron
     case parakeet
+    case fluidSpeechCoreML
 
     /// Hugging Face repository file patterns needed for local model loading.
-    var downloadFilePatterns: [String] {
-        ["*.safetensors", "*.json", "*.txt", "*.wav"]
+    /// Supports leading `*` suffix matches, trailing `*` prefix matches, and exact paths.
+    nonisolated var downloadFilePatterns: [String] {
+        switch self {
+        case .qwen3, .nemotron, .parakeet:
+            return ["*.safetensors", "*.json", "*.txt", "*.wav"]
+        case .fluidSpeechCoreML:
+            return [
+                "Preprocessor.mlmodelc/*",
+                "Encoder.mlmodelc/*",
+                "Decoder.mlmodelc/*",
+                "JointDecision.mlmodelc/*",
+                "config.json",
+                "parakeet_vocab.json",
+                "parakeet_v3_vocab.json",
+            ]
+        }
     }
 
     /// Files, beyond weights and config.json, that must exist locally for a
     /// snapshot to count as downloaded.
-    var requiredAuxiliaryFiles: [String] {
+    nonisolated var requiredAuxiliaryFiles: [String] {
         switch self {
         case .qwen3:
             return ["vocab.json", "merges.txt", "tokenizer_config.json"]
-        case .nemotron:
+        case .nemotron, .parakeet:
             return []
-        case .parakeet:
-            return []
+        case .fluidSpeechCoreML:
+            return [
+                "Preprocessor.mlmodelc/model.mil",
+                "Preprocessor.mlmodelc/weights/weight.bin",
+                "Encoder.mlmodelc/model.mil",
+                "Encoder.mlmodelc/weights/weight.bin",
+                "Decoder.mlmodelc/model.mil",
+                "Decoder.mlmodelc/weights/weight.bin",
+                "JointDecision.mlmodelc/model.mil",
+                "JointDecision.mlmodelc/weights/weight.bin",
+                "parakeet_vocab.json",
+            ]
+        }
+    }
+
+    nonisolated var usesSafetensorsWeights: Bool {
+        switch self {
+        case .qwen3, .nemotron, .parakeet:
+            return true
+        case .fluidSpeechCoreML:
+            return false
         }
     }
 }
@@ -70,6 +104,12 @@ struct STTModelDefinition: Identifiable, Hashable {
             displayName: "Parakeet TDT 0.6B v3",
             repoID: "mlx-community/parakeet-tdt-0.6b-v3",
             family: .parakeet
+        ),
+        STTModelDefinition(
+            id: "fluid-speech-pro-coreml",
+            displayName: "Fluid Speech Pro (Core ML)",
+            repoID: "FluidVoice-Labs/fluid-speech-pro-coreml",
+            family: .fluidSpeechCoreML
         ),
     ]
 

@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		AD268C8F2F3F197400514254 /* MLXAudioSTT in Frameworks */ = {isa = PBXBuildFile; productRef = AA000002AAAA000000000001 /* MLXAudioSTT */; };
 		AD268C902F3F197400514254 /* MLXAudioCore in Frameworks */ = {isa = PBXBuildFile; productRef = AA000002AAAA000000000002 /* MLXAudioCore */; };
+		AD268C912F3F197400514254 /* FluidAudio in Frameworks */ = {isa = PBXBuildFile; productRef = AA000002AAAA000000000003 /* FluidAudio */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -57,6 +58,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AD268C912F3F197400514254 /* FluidAudio in Frameworks */,
 				AD268C902F3F197400514254 /* MLXAudioCore in Frameworks */,
 				AD268C8F2F3F197400514254 /* MLXAudioSTT in Frameworks */,
 			);
@@ -121,6 +123,7 @@
 			packageProductDependencies = (
 				AA000002AAAA000000000001 /* MLXAudioSTT */,
 				AA000002AAAA000000000002 /* MLXAudioCore */,
+				AA000002AAAA000000000003 /* FluidAudio */,
 			);
 			productName = whisper;
 			productReference = AD268BB72F3F09A700514254 /* whisper.app */;
@@ -206,6 +209,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				AA000001AAAA000000000001 /* XCRemoteSwiftPackageReference "mlx-audio-swift" */,
+				AA000001AAAA000000000002 /* XCRemoteSwiftPackageReference "FluidAudio" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = AD268BB82F3F09A700514254 /* Products */;
@@ -603,6 +607,14 @@
 				version = 0.1.9;
 			};
 		};
+		AA000001AAAA000000000002 /* XCRemoteSwiftPackageReference "FluidAudio" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/altic-dev/FluidAudio.git";
+			requirement = {
+				kind = revision;
+				revision = 386f7195670b77f2954c7ee143ec63fcb50b6c3b;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -615,6 +627,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = AA000001AAAA000000000001 /* XCRemoteSwiftPackageReference "mlx-audio-swift" */;
 			productName = MLXAudioCore;
+		};
+		AA000002AAAA000000000003 /* FluidAudio */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AA000001AAAA000000000002 /* XCRemoteSwiftPackageReference "FluidAudio" */;
+			productName = FluidAudio;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

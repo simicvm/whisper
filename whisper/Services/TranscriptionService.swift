@@ -1,19 +1,26 @@
 import Foundation
 import os
+import FluidAudio
 import MLX
 import MLXAudioSTT
 import MLXAudioCore
 import HuggingFace
 
-/// Loads MLXAudioSTT speech-to-text models and transcribes audio with them.
+/// Loads speech-to-text models (MLXAudioSTT and Core ML via FluidAudio) and transcribes audio with them.
 ///
 /// The actor isolates model ownership and serializes operations.
-/// Inference itself runs on a dedicated queue so long synchronous
-/// `model.generate(...)` work does not execute on Swift's cooperative executor.
+/// Synchronous MLX inference runs on a dedicated queue so long `model.generate(...)`
+/// work does not execute on Swift's cooperative executor.
 actor TranscriptionService {
     private static let metalCacheLimitBytes = 64 * 1024 * 1024
+    internal static let coreMLMinimumSampleCount = 16_000
 
-    private var model: (any STTGenerationModel)?
+    private enum LoadedModel {
+        case mlx(any STTGenerationModel)
+        case fluidCoreML(AsrManager)
+    }
+
+    private var loadedModel: LoadedModel?
     private var currentFamily: STTModelFamily?
     private var currentRepoID: String?
     private var didConfigureMetalCacheLimit = false
@@ -55,10 +62,15 @@ actor TranscriptionService {
     }
 
     /// Whether a model is currently loaded and ready.
-    var isLoaded: Bool { model != nil }
+    var isLoaded: Bool { loadedModel != nil }
 
     /// Whether the currently loaded model supports incremental streaming during recording.
-    var supportsLiveStreaming: Bool { model is NemotronASRModel }
+    var supportsLiveStreaming: Bool {
+        if case .mlx(let mlxModel) = loadedModel {
+            return mlxModel is NemotronASRModel
+        }
+        return false
+    }
 
     /// Starts an incremental streaming session for Nemotron 3.5 ASR models so
     /// audio chunks can be encoded while the user is still speaking.
@@ -67,7 +79,8 @@ actor TranscriptionService {
         try Task.checkCancellation()
         try await acquireOperationTurn()
 
-        guard let nemotronModel = model as? NemotronASRModel else {
+        guard case .mlx(let mlxModel) = loadedModel,
+              let nemotronModel = mlxModel as? NemotronASRModel else {
             releaseOperationTurn()
             return nil
         }
@@ -127,7 +140,7 @@ actor TranscriptionService {
         try Task.checkCancellation()
 
         if currentRepoID == repoID {
-            invalidateLoadedModel()
+            await invalidateLoadedModel()
         }
 
         for cachePath in Self.cachePathsToDelete(for: repoID) {
@@ -151,17 +164,17 @@ actor TranscriptionService {
         }
 
         // Skip if already loaded with same model
-        if currentRepoID == repoID && model != nil {
+        if currentRepoID == repoID && loadedModel != nil {
             return
         }
 
-        if !didConfigureMetalCacheLimit {
+        if definition.family.usesSafetensorsWeights && !didConfigureMetalCacheLimit {
             Memory.cacheLimit = Self.metalCacheLimitBytes
             didConfigureMetalCacheLimit = true
         }
 
         // Unload previous model
-        invalidateLoadedModel()
+        await invalidateLoadedModel()
         let generation = loadGeneration
 
         try Task.checkCancellation()
@@ -174,20 +187,22 @@ actor TranscriptionService {
 
         let loaded = try await loadPretrainedModel(for: definition)
 
-        try Task.checkCancellation()
-        guard generation == loadGeneration else {
+        if Task.isCancelled || generation != loadGeneration {
+            if case .fluidCoreML(let manager) = loaded {
+                await manager.cleanup()
+            }
             throw CancellationError()
         }
 
-        model = loaded
+        loadedModel = loaded
         currentFamily = definition.family
         currentRepoID = repoID
-        scheduleShaderWarmup(generation: generation)
+        scheduleWarmup(generation: generation)
     }
 
     private func loadPretrainedModel(
         for definition: STTModelDefinition
-    ) async throws -> any STTGenerationModel {
+    ) async throws -> LoadedModel {
         let modelDir = Self.modelDirectory(for: definition.repoID)
         let hasLocalSnapshot = await Self.hasCompleteModelSnapshot(
             at: modelDir,
@@ -197,23 +212,28 @@ actor TranscriptionService {
         switch definition.family {
         case .qwen3:
             if hasLocalSnapshot {
-                return try await Qwen3ASRModel.fromModelDirectory(modelDir)
+                return .mlx(try await Qwen3ASRModel.fromModelDirectory(modelDir))
             }
-            return try await Qwen3ASRModel.fromPretrained(definition.repoID)
+            return .mlx(try await Qwen3ASRModel.fromPretrained(definition.repoID))
         case .nemotron:
             if hasLocalSnapshot {
-                return try await loadOnInferenceQueue {
+                return .mlx(try await loadOnInferenceQueue {
                     try NemotronASRModel.fromDirectory(modelDir)
-                }
+                })
             }
-            return try await NemotronASRModel.fromPretrained(definition.repoID)
+            return .mlx(try await NemotronASRModel.fromPretrained(definition.repoID))
         case .parakeet:
             if hasLocalSnapshot {
-                return try await loadOnInferenceQueue {
+                return .mlx(try await loadOnInferenceQueue {
                     try ParakeetModel.fromDirectory(modelDir)
-                }
+                })
             }
-            return try await ParakeetModel.fromPretrained(definition.repoID)
+            return .mlx(try await ParakeetModel.fromPretrained(definition.repoID))
+        case .fluidSpeechCoreML:
+            let models = try await AsrModels.load(from: modelDir, version: .fluidParakeetPro)
+            let manager = AsrManager()
+            try await manager.initialize(models: models)
+            return .fluidCoreML(manager)
         }
     }
 
@@ -235,17 +255,16 @@ actor TranscriptionService {
         return box.model
     }
 
-    /// Pre-compiles Metal inference pipelines with a tiny silent clip right
-    /// after model load so the very first dictation does not pay shader
-    /// compilation latency.
-    private func scheduleShaderWarmup(generation: UInt64) {
+    /// Pre-warms inference pipelines with a short silent clip right after model
+    /// load so the very first dictation does not pay first-run compilation latency.
+    private func scheduleWarmup(generation: UInt64) {
         warmupTask?.cancel()
         warmupTask = Task(priority: .utility) {
-            await performShaderWarmup(generation: generation)
+            await performWarmup(generation: generation)
         }
     }
 
-    private func performShaderWarmup(generation: UInt64) async {
+    private func performWarmup(generation: UInt64) async {
         do {
             try await acquireOperationTurn()
         } catch {
@@ -255,21 +274,36 @@ actor TranscriptionService {
 
         guard !Task.isCancelled,
               generation == loadGeneration,
-              let model,
+              let loadedModel,
               let currentFamily else {
             return
         }
 
-        let warmupSamples = [Float](repeating: 0, count: max(1, model.sampleRate / 4))
-        let parameters: STTGenerateParameters
-        switch currentFamily {
-        case .qwen3:
-            parameters = STTGenerateParameters(maxTokens: 1, language: "English")
-        case .nemotron, .parakeet:
-            parameters = STTGenerateParameters(language: "en")
-        }
+        switch loadedModel {
+        case .mlx(let model):
+            let warmupSamples = [Float](repeating: 0, count: max(1, model.sampleRate / 4))
+            let parameters: STTGenerateParameters
+            switch currentFamily {
+            case .qwen3:
+                parameters = STTGenerateParameters(maxTokens: 1, language: "English")
+            case .nemotron, .parakeet, .fluidSpeechCoreML:
+                parameters = STTGenerateParameters(language: "en")
+            }
 
-        _ = await runInference(model: model, parameters: parameters, audio: warmupSamples)
+            _ = await runInference(model: model, parameters: parameters, audio: warmupSamples)
+
+        case .fluidCoreML(let manager):
+            let warmupSamples = [Float](repeating: 0, count: Self.coreMLMinimumSampleCount)
+            _ = try? await manager.transcribe(warmupSamples, source: .microphone)
+        }
+    }
+
+    internal static func padCoreMLAudioIfNeeded(
+        _ audio: [Float],
+        minimumSampleCount: Int = coreMLMinimumSampleCount
+    ) -> [Float] {
+        guard audio.count < minimumSampleCount else { return audio }
+        return audio + [Float](repeating: 0, count: minimumSampleCount - audio.count)
     }
 
     internal static func qwen3MaxTokens(
@@ -301,7 +335,7 @@ actor TranscriptionService {
             // ("en", not "English"); unrecognized keys silently fall back
             // to "auto" language detection.
             return STTGenerateParameters(language: "en")
-        case .parakeet:
+        case .parakeet, .fluidSpeechCoreML:
             return STTGenerateParameters(language: "en")
         }
     }
@@ -316,7 +350,7 @@ actor TranscriptionService {
         let modelDir = modelDirectory(for: definition.repoID)
         guard !(await hasCompleteModelSnapshot(at: modelDir, family: definition.family)) else { return }
 
-        guard let hfRepoID = Repo.ID(rawValue: definition.repoID) else {
+        guard let hfRepoID = HuggingFace.Repo.ID(rawValue: definition.repoID) else {
             throw TranscriptionError.invalidRepositoryID(definition.repoID)
         }
 
@@ -362,7 +396,7 @@ actor TranscriptionService {
             legacyModelDirectory(for: repoID),
         ]
 
-        if let hfRepoID = Repo.ID(rawValue: repoID) {
+        if let hfRepoID = HuggingFace.Repo.ID(rawValue: repoID) {
             let cache = HubCache.default
             let repoDirectory = cache.repoDirectory(repo: hfRepoID, kind: .model)
             paths.append(repoDirectory)
@@ -394,7 +428,7 @@ actor TranscriptionService {
 
     private static func downloadModelFiles(
         for definition: STTModelDefinition,
-        repo: Repo.ID,
+        repo: HuggingFace.Repo.ID,
         to modelDir: URL,
         updateHandler: (@MainActor @Sendable (ModelLoadUpdate) -> Void)?
     ) async throws {
@@ -520,11 +554,14 @@ actor TranscriptionService {
         try manifestData.write(to: manifestURL, options: .atomic)
     }
 
-    private static func matchesDownloadPatterns(path: String, patterns: [String]) -> Bool {
+    internal static func matchesDownloadPatterns(path: String, patterns: [String]) -> Bool {
         guard !patterns.isEmpty else { return true }
         return patterns.contains { pattern in
             if pattern.hasPrefix("*") {
                 return path.hasSuffix(String(pattern.dropFirst()))
+            }
+            if pattern.hasSuffix("*") {
+                return path.hasPrefix(String(pattern.dropLast()))
             }
             return path == pattern
         }
@@ -544,7 +581,7 @@ actor TranscriptionService {
         }
     }
 
-    private static func downloadURL(for path: String, repo: Repo.ID, host: URL) -> URL {
+    private static func downloadURL(for path: String, repo: HuggingFace.Repo.ID, host: URL) -> URL {
         host
             .appending(path: repo.namespace)
             .appending(path: repo.name)
@@ -620,40 +657,45 @@ actor TranscriptionService {
             }
         }
 
-        let files = (try? fm.contentsOfDirectory(
-            at: modelDir,
-            includingPropertiesForKeys: [.fileSizeKey]
-        )) ?? []
+        if family.usesSafetensorsWeights {
+            let files = (try? fm.contentsOfDirectory(
+                at: modelDir,
+                includingPropertiesForKeys: [.fileSizeKey]
+            )) ?? []
 
-        let hasWeights = files.contains { file in
-            guard file.pathExtension == "safetensors" else { return false }
-            let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
-            return size > 0
-        }
-        guard hasWeights else { return false }
-
-        // For sharded checkpoints, verify every shard referenced by the index exists and is non-empty.
-        let indexURL = modelDir.appendingPathComponent("model.safetensors.index.json")
-        if fm.fileExists(atPath: indexURL.path) {
-            guard let indexData = try? Data(contentsOf: indexURL),
-                  let indexJSON = try? JSONSerialization.jsonObject(with: indexData) as? [String: Any],
-                  let weightMap = indexJSON["weight_map"] as? [String: String] else {
-                return false
+            let hasWeights = files.contains { file in
+                guard file.pathExtension == "safetensors" else { return false }
+                let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+                return size > 0
             }
-            let requiredShards = Set(weightMap.values)
-            guard !requiredShards.isEmpty else { return false }
-            for shardName in requiredShards {
-                guard let shardURL = try? modelFileDestination(for: shardName, in: modelDir),
-                      let shardSize = localFileSize(at: shardURL),
-                      shardSize > 0 else {
+            guard hasWeights else { return false }
+
+            // For sharded checkpoints, verify every shard referenced by the index exists and is non-empty.
+            let indexURL = modelDir.appendingPathComponent("model.safetensors.index.json")
+            if fm.fileExists(atPath: indexURL.path) {
+                guard let indexData = try? Data(contentsOf: indexURL),
+                      let indexJSON = try? JSONSerialization.jsonObject(with: indexData) as? [String: Any],
+                      let weightMap = indexJSON["weight_map"] as? [String: String] else {
                     return false
+                }
+                let requiredShards = Set(weightMap.values)
+                guard !requiredShards.isEmpty else { return false }
+                for shardName in requiredShards {
+                    guard let shardURL = try? modelFileDestination(for: shardName, in: modelDir),
+                          let shardSize = localFileSize(at: shardURL),
+                          shardSize > 0 else {
+                        return false
+                    }
                 }
             }
         }
 
         let hasAuxiliaryFiles = family.requiredAuxiliaryFiles.allSatisfy { fileName in
-            let url = modelDir.appendingPathComponent(fileName)
-            guard let size = localFileSize(at: url), size > 0 else { return false }
+            guard let url = try? modelFileDestination(for: fileName, in: modelDir),
+                  let size = localFileSize(at: url),
+                  size > 0 else {
+                return false
+            }
             return true
         }
         guard hasAuxiliaryFiles else { return false }
@@ -680,7 +722,7 @@ actor TranscriptionService {
         defer { releaseOperationTurn() }
         try Task.checkCancellation()
 
-        guard let model, let currentFamily else {
+        guard let loadedModel, let currentFamily else {
             throw TranscriptionError.modelNotLoaded
         }
 
@@ -690,17 +732,25 @@ actor TranscriptionService {
 
         try Task.checkCancellation()
 
-        let parameters = Self.generationParameters(
-            for: currentFamily,
-            audioSampleCount: audio.count,
-            sampleRate: Double(model.sampleRate)
-        )
+        let text: String
+        switch loadedModel {
+        case .mlx(let model):
+            let parameters = Self.generationParameters(
+                for: currentFamily,
+                audioSampleCount: audio.count,
+                sampleRate: Double(model.sampleRate)
+            )
+            text = await runInference(
+                model: model,
+                parameters: parameters,
+                audio: audio
+            )
 
-        let text = await runInference(
-            model: model,
-            parameters: parameters,
-            audio: audio
-        )
+        case .fluidCoreML(let manager):
+            let paddedAudio = Self.padCoreMLAudioIfNeeded(audio)
+            let result = try await manager.transcribe(paddedAudio, source: .microphone)
+            text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
 
         try Task.checkCancellation()
 
@@ -711,14 +761,22 @@ actor TranscriptionService {
         return text
     }
 
-    private func invalidateLoadedModel() {
+    private func invalidateLoadedModel() async {
         loadGeneration &+= 1
         warmupTask?.cancel()
         warmupTask = nil
-        model = nil
+        let previousModel = loadedModel
+        loadedModel = nil
         currentFamily = nil
         currentRepoID = nil
-        Memory.clearCache()
+        switch previousModel {
+        case .mlx:
+            Memory.clearCache()
+        case .fluidCoreML(let manager):
+            await manager.cleanup()
+        case nil:
+            break
+        }
     }
 
     private func acquireOperationTurn() async throws {

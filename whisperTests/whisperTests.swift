@@ -271,4 +271,58 @@ struct whisperTests {
         #expect(abs(out.count - 24_000) <= 64)
     }
 
+    @Test
+    func fluidSpeechCoreMLDownloadPatternsFilterModelFilesOnly() {
+        let patterns = STTModelFamily.fluidSpeechCoreML.downloadFilePatterns
+
+        #expect(TranscriptionService.matchesDownloadPatterns(path: "Encoder.mlmodelc/weights/weight.bin", patterns: patterns))
+        #expect(TranscriptionService.matchesDownloadPatterns(path: "Preprocessor.mlmodelc/model.mil", patterns: patterns))
+        #expect(TranscriptionService.matchesDownloadPatterns(path: "Decoder.mlmodelc/analytics/coremldata.bin", patterns: patterns))
+        #expect(TranscriptionService.matchesDownloadPatterns(path: "JointDecision.mlmodelc/metadata.json", patterns: patterns))
+        #expect(TranscriptionService.matchesDownloadPatterns(path: "config.json", patterns: patterns))
+        #expect(TranscriptionService.matchesDownloadPatterns(path: "parakeet_vocab.json", patterns: patterns))
+        #expect(TranscriptionService.matchesDownloadPatterns(path: "parakeet_v3_vocab.json", patterns: patterns))
+
+        #expect(!TranscriptionService.matchesDownloadPatterns(path: "README.md", patterns: patterns))
+        #expect(!TranscriptionService.matchesDownloadPatterns(path: "LICENSE", patterns: patterns))
+        #expect(!TranscriptionService.matchesDownloadPatterns(path: "examples/swift/Package.swift", patterns: patterns))
+        #expect(!TranscriptionService.matchesDownloadPatterns(path: "examples/swift/Sources/transcribe/main.swift", patterns: patterns))
+    }
+
+    @Test
+    func fluidSpeechCoreMLSnapshotValidationRequiresAllBundlesAndVocab() throws {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent("whisper-coreml-snapshot-test-\(UUID().uuidString)")
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: dir) }
+
+        try Data("{}".utf8).write(to: dir.appendingPathComponent("config.json"))
+        #expect(!TranscriptionService.hasCompleteModelSnapshotSync(at: dir, family: .fluidSpeechCoreML))
+
+        let required = STTModelFamily.fluidSpeechCoreML.requiredAuxiliaryFiles
+        for path in required.dropLast() {
+            let fileURL = dir.appendingPathComponent(path)
+            try fm.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("x".utf8).write(to: fileURL)
+        }
+        // Still missing the last required file (parakeet_vocab.json).
+        #expect(!TranscriptionService.hasCompleteModelSnapshotSync(at: dir, family: .fluidSpeechCoreML))
+
+        let lastURL = dir.appendingPathComponent(required.last!)
+        try Data("{\"0\":\"<unk>\"}".utf8).write(to: lastURL)
+        #expect(TranscriptionService.hasCompleteModelSnapshotSync(at: dir, family: .fluidSpeechCoreML))
+    }
+
+    @Test
+    func coreMLAudioPaddingEnforcesOneSecondMinimum() {
+        let shortClip: [Float] = [0.25, -0.5, 0.75]
+        let padded = TranscriptionService.padCoreMLAudioIfNeeded(shortClip)
+        #expect(padded.count == 16_000)
+        #expect(Array(padded.prefix(3)) == shortClip)
+        #expect(padded.dropFirst(3).allSatisfy { $0 == 0 })
+
+        let fullClip = [Float](repeating: 0.1, count: 20_000)
+        #expect(TranscriptionService.padCoreMLAudioIfNeeded(fullClip).count == 20_000)
+    }
+
 }
